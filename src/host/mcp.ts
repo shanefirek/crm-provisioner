@@ -3,6 +3,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { memoryAdapter } from "../adapters/memory.ts";
+import { salesforceAdapter } from "../adapters/salesforce.ts";
 import type { Adapter, ConnectionContext, Plan, RunStepRecord } from "../adapters/types.ts";
 import { applyOverlay } from "../core/overlay.ts";
 import { DeltaSpecSchema, ProvisionSpecSchema, type ProvisionSpec } from "../core/spec.ts";
@@ -12,7 +13,8 @@ import { db } from "./db.ts";
 type CachedPlan = { plan: Plan; conn_id: string; spec: ProvisionSpec };
 const PLAN_CACHE = new Map<string, CachedPlan>();
 
-function adapterFor(_crm: string): Adapter {
+function adapterFor(crm: string): Adapter {
+  if (crm === "salesforce") return salesforceAdapter;
   return memoryAdapter;
 }
 
@@ -101,14 +103,16 @@ export function buildMcpServer(): McpServer {
           .default([])
           .describe("Allowlist of api_domain values this connection may write to. Empty array = allow any (demo only)."),
         api_domain: z.string().optional().describe("The CRM instance URL / API domain; checked against writable_org_ids on apply()"),
+        access_token: z.string().optional().describe("P2 dev only — paste an existing token. P3 host work replaces with OAuth callback."),
+        refresh_token: z.string().optional(),
       },
     },
-    async ({ crm, org_label, is_demo, writable_org_ids, api_domain }) => {
+    async ({ crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token }) => {
       const id = crypto.randomUUID();
       await db.query(
-        `insert into connections (id, crm, org_label, is_demo, writable_org_ids, api_domain)
-           values ($1, $2, $3, $4, $5, $6)`,
-        [id, crm, org_label ?? `${crm} connection`, is_demo, writable_org_ids, api_domain ?? null],
+        `insert into connections (id, crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token)
+           values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [id, crm, org_label ?? `${crm} connection`, is_demo, writable_org_ids, api_domain ?? null, access_token ?? null, refresh_token ?? null],
       );
       return ok(JSON.stringify({ connection_id: id, crm, is_demo, writable_org_ids, api_domain: api_domain ?? null }, null, 2));
     },

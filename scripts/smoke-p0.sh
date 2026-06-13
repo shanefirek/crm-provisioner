@@ -201,6 +201,85 @@ echo "== /health =="
 H=$(curl -sS "$BASE/health")
 echo "$H" | grep -q '"phase":"P0"' && pass "/health says P0" || fail "/health says P0" "$H"
 
+# ============================================================================
+# LIVE SFDC SMOKE — gated on SF_LIVE=1 (the pre-commit hook does NOT pass this)
+# ============================================================================
+# Touches real shane-dev org. Creates a probe field, verifies via SOQL through
+# the adapter's snapshot, tears down, verifies removal. Skipped by default.
+if [ "${SF_LIVE:-0}" = "1" ]; then
+  echo
+  echo "== LIVE: Salesforce adapter end-to-end =="
+  SF_TOKEN=$(sf org display --target-org shane-dev --json 2>/dev/null | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0)).result.accessToken)")
+  SF_URL="https://orgfarm-e843df8348-dev-ed.develop.my.salesforce.com"
+  [ -n "$SF_TOKEN" ] && pass "got sf access token (len=${#SF_TOKEN})" || fail "got sf access token" "empty — run 'sf org login web' first"
+
+  # Connection: declares writable_org_ids = exactly shane-dev's URL.
+  # Pass token via env to dodge any shell-escaping pitfalls.
+  ARGS=$(SF_TOKEN="$SF_TOKEN" SF_URL="$SF_URL" node -e '
+const args = { name: "connect_crm", arguments: {
+  crm: "salesforce",
+  org_label: "shane-dev (LIVE)",
+  is_demo: true,
+  api_domain: process.env.SF_URL,
+  writable_org_ids: [process.env.SF_URL],
+  access_token: process.env.SF_TOKEN
+}};
+process.stdout.write(JSON.stringify(args));
+')
+  R=$(mcp_call 50 'tools/call' "$ARGS" | text_of)
+  SF_CONN=$(echo "$R" | field_of connection_id)
+  [ -n "$SF_CONN" ] && pass "live SFDC connection created" || fail "live SFDC connection" "$R"
+
+  # inspect — should pull real stage list
+  R=$(mcp_call 51 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$SF_CONN\"}}" | text_of)
+  STAGE_COUNT=$(echo "$R" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).snapshot?.stages||[]).length))")
+  [ "$STAGE_COUNT" -ge 5 ] && pass "live inspect returns >=5 real stages" || fail "live inspect stages" "got $STAGE_COUNT"
+
+  # plan + apply a single field-only delta (cheap, fast, easy to teardown)
+  SF_DELTA='{"spec_version":0,"fields":[{"api_name":"prov_smoke_field","label":"prov_smoke_field","kind":"text","module":"Lead","length":80,"description":"crm-provisioner P2 smoke — safe to delete"}],"stages":[],"pipelines":[],"workflows":[]}'
+  R=$(mcp_call 52 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$SF_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$SF_DELTA}}" | text_of)
+  SF_PLAN=$(echo "$R" | field_of plan_id)
+  [ -n "$SF_PLAN" ] && pass "live plan returned plan_id" || fail "live plan" "$R"
+
+  R=$(mcp_call 53 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$SF_PLAN\"}}" | text_of)
+  SF_RUN=$(echo "$R" | field_of run_id)
+  SF_STATUS=$(echo "$R" | field_of status)
+  [ "$SF_STATUS" = "succeeded" ] && pass "live apply succeeded" || fail "live apply" "$R"
+
+  # Verify via re-inspect — the new field should appear
+  R=$(mcp_call 54 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$SF_CONN\"}}" | text_of)
+  FOUND=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const f=(d.snapshot?.fields_lead||[]).find(x=>x.DeveloperName==='prov_smoke_field');
+process.stdout.write(f ? 'yes' : 'no');
+")
+  [ "$FOUND" = "yes" ] && pass "live: probe field exists in SFDC" || fail "probe field exists after apply" "got $FOUND"
+
+  # Idempotency: a second plan should diff to noop on the field
+  R=$(mcp_call 55 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$SF_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$SF_DELTA}}" | text_of)
+  NOOP_FIELD=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field' && x.payload?.api_name==='prov_smoke_field');
+process.stdout.write(s?.diff || 'missing');
+")
+  [ "$NOOP_FIELD" = "noop" ] && pass "live: second plan shows noop on existing field (idempotent)" || fail "idempotent re-plan" "got '$NOOP_FIELD'"
+
+  # Teardown — verify the field is removed
+  R=$(mcp_call 56 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$SF_RUN\"}}" | text_of)
+  TD_STATUS=$(echo "$R" | field_of status)
+  [ "$TD_STATUS" = "succeeded" ] && pass "live teardown succeeded" || fail "live teardown" "$R"
+
+  R=$(mcp_call 57 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$SF_CONN\"}}" | text_of)
+  GONE=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const f=(d.snapshot?.fields_lead||[]).find(x=>x.DeveloperName==='prov_smoke_field');
+process.stdout.write(f ? 'still-there' : 'gone');
+")
+  [ "$GONE" = "gone" ] && pass "live: probe field removed by teardown" || fail "probe field removed" "got $GONE"
+else
+  echo "  (SF_LIVE=0 — live SFDC assertions skipped. Run 'SF_LIVE=1 bash scripts/smoke-p0.sh' to exercise.)"
+fi
+
 # ---- summary ----
 echo
 echo "== Summary =="
