@@ -376,6 +376,19 @@ process.stdout.write(String((d.steps||[]).filter(s=>s.status==='skipped_by_watch
 ")
 [ "$SKIPPED" -ge 1 ] && pass "P7: downstream steps marked skipped_by_watchdog ($SKIPPED of them)" || fail "P7 skipped count" "got $SKIPPED"
 
+# P11: the run row carries watchdog_window_failures for post-mortem (was set + queryable
+# pre-P11 but never asserted). The trip happens once the rolling window hits the threshold;
+# the column records the failures-in-window count at trip time so an operator can
+# distinguish "narrowly tripped" from "everything was failing."
+RUN_FORENSICS=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+process.stdout.write(String(d.run?.watchdog_window_failures ?? 'missing'));
+")
+case "$RUN_FORENSICS" in
+  ''|missing|0) fail "P11: runs.watchdog_window_failures recorded on trip" "got '$RUN_FORENSICS' (expected positive int per P7 retro: 6-of-N trip should record window failures)" ;;
+  *) pass "P11: runs.watchdog_window_failures = $RUN_FORENSICS (post-mortem forensics queryable)" ;;
+esac
+
 # (b) 4-of-10 — should NOT trip (4/10 = 40% < 50% threshold; watchdog stays quiet)
 R=$(mcp_call 114 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p7-nt","is_demo":true,"api_domain":"memory://p7nt","writable_org_ids":["memory://p7nt"]}}' | text_of)
 P7_CONN_NT=$(echo "$R" | field_of connection_id)
@@ -408,6 +421,122 @@ P7_STATUS_SS=$(echo "$R" | field_of status)
 P7_ABORT_SS=$(echo "$R" | field_of aborted_by)
 [ "$P7_STATUS_SS" = "aborted" ] && pass "P7: silent-success run aborts" || fail "P7 silent-success status" "got '$P7_STATUS_SS'"
 echo "$P7_ABORT_SS" | grep -q 'WatchdogError:silent_success_rate' && pass "P7: aborted_by names silent_success_rate" || fail "P7 silent aborted_by" "got '$P7_ABORT_SS'"
+
+# ---- P11: testing-gap closure ----
+
+echo "== P11: SFDC/Zoho fixtures → classifier (standalone) =="
+if node --experimental-strip-types --no-warnings scripts/test-classifiers.mjs >/tmp/p11-cls.out 2>&1; then
+  pass "P11: classifier-on-fixtures test-script green (converts 4 captured envelopes into regression guards)"
+else
+  fail "P11 classifier-on-fixtures" "$(cat /tmp/p11-cls.out)"
+fi
+
+echo "== P11: applyOverlay edge cases (standalone) =="
+if node --experimental-strip-types --no-warnings scripts/test-overlay.mjs >/tmp/p11-ov.out 2>&1; then
+  pass "P11: overlay-direct test-script green (multi-error accumulation, pipeline branch, stableHash determinism)"
+else
+  fail "P11 overlay-direct" "$(cat /tmp/p11-ov.out)"
+fi
+
+echo "== P11: memory-adapter throws BoundaryError:rate_limit (retry path was untested) =="
+P11_DELTA_RL='{"spec_version":0,"fields":[{"api_name":"test__throw_boundary_rate_limit_1","label":"x","kind":"text","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+R=$(mcp_call 140 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P11_DELTA_RL}}" | text_of)
+P11_PLAN_RL=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 141 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P11_PLAN_RL\"}}" | text_of)
+RL_STATUS=$(echo "$R" | field_of status)
+RL_RUN=$(echo "$R" | field_of run_id)
+[ "$RL_STATUS" = "partial" ] && pass "P11: rate_limit-throw apply → 'partial' (retried per matrix, then failed)" || fail "P11 rate_limit status" "got '$RL_STATUS'"
+R=$(mcp_call 142 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$RL_RUN\"}}" | text_of)
+RL_STEP=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field');
+process.stdout.write(JSON.stringify({code:s?.error_code, attempts:s?.attempts}));
+")
+echo "$RL_STEP" | grep -q '"code":"BoundaryError:rate_limit"' && pass "P11: rate_limit error_code = BoundaryError:rate_limit (typed)" || fail "P11 rate_limit error_code" "$RL_STEP"
+echo "$RL_STEP" | grep -q '"attempts":5' && pass "P11: rate_limit attempts = 5 (retried per matrix, same as transient)" || fail "P11 rate_limit attempts" "$RL_STEP"
+
+echo "== P11: memory-adapter throws BoundaryError:rejected (no-retry + cacheable) =="
+P11_DELTA_RJ='{"spec_version":0,"fields":[{"api_name":"test__throw_boundary_rejected_1","label":"x","kind":"text","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+R=$(mcp_call 143 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P11_DELTA_RJ}}" | text_of)
+P11_PLAN_RJ=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 144 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P11_PLAN_RJ\"}}" | text_of)
+RJ_STATUS=$(echo "$R" | field_of status)
+RJ_RUN=$(echo "$R" | field_of run_id)
+[ "$RJ_STATUS" = "partial" ] && pass "P11: rejected-throw apply → 'partial'" || fail "P11 rejected status" "got '$RJ_STATUS'"
+R=$(mcp_call 145 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$RJ_RUN\"}}" | text_of)
+RJ_STEP=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field');
+process.stdout.write(JSON.stringify({code:s?.error_code, attempts:s?.attempts}));
+")
+echo "$RJ_STEP" | grep -q '"code":"BoundaryError:rejected"' && pass "P11: rejected error_code = BoundaryError:rejected (typed)" || fail "P11 rejected error_code" "$RJ_STEP"
+echo "$RJ_STEP" | grep -q '"attempts":1' && pass "P11: rejected attempts = 1 (no retry per matrix, distinct from transient/rate_limit)" || fail "P11 rejected attempts" "$RJ_STEP"
+# rejected is cacheable per isCacheableFailure — second plan against the same delta must see blocked_by_prior_failure.
+R=$(mcp_call 146 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P11_DELTA_RJ}}" | text_of)
+RJ_BLOCKED=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+process.stdout.write(String(d.blocked_count ?? 0));
+")
+[ "$RJ_BLOCKED" -ge 1 ] && pass "P11: BoundaryError:rejected lands in permanent_failures cache (blocked_count=$RJ_BLOCKED on re-plan)" || fail "P11 rejected cacheable" "got blocked_count=$RJ_BLOCKED"
+
+# ---- P10: host concurrency + retry correctness ----
+
+echo "== P10: computeDelay honors Retry-After (standalone) =="
+# Runs in-process — no server, no DB. Asserts the math directly per the audit's audit
+# finding: a 60s Retry-After was silently clamped to 10s, burning attempts on 429.
+if node --experimental-strip-types --no-warnings scripts/test-retry-after.mjs >/tmp/p10-retry.out 2>&1; then
+  pass "P10: computeDelay test-script green (Retry-After honored to retryAfterCapMs)"
+else
+  fail "P10 computeDelay test-script" "$(cat /tmp/p10-retry.out)"
+fi
+
+echo "== P10: concurrent applies on the same plan_id don't share state =="
+# The audit caught: cached.plan was mutated in-place; two concurrent applies on the
+# same plan_id corrupted each other. The fix shallow-clones the plan before dispatch.
+# This smoke proves the clone: two applies fire on the same plan_id, both should
+# observe an independent step view (status either succeeded for the winner of the
+# PLAN_CACHE.delete race, or PLAN_NOT_FOUND for the loser — never a corrupted shared mid-state).
+R=$(mcp_call 130 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p10-concurrent","is_demo":true,"api_domain":"memory://p10c","writable_org_ids":["memory://p10c"]}}' | text_of)
+P10_CONN=$(echo "$R" | field_of connection_id)
+P10_DELTA='{"spec_version":0,"fields":[{"api_name":"p10_concurrent_field","label":"x","kind":"text","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+R=$(mcp_call 131 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P10_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P10_DELTA}}" | text_of)
+P10_PLAN=$(echo "$R" | field_of plan_id)
+# Fire two applies in parallel. Background both, wait for both, then verify neither
+# produced a corrupted response shape (the failure mode if the clone wasn't in place
+# is that one apply's step seq indexing reads from the other's mutated steps).
+mcp_call 132 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P10_PLAN\"}}" >/tmp/p10-a.out 2>&1 &
+PID_A=$!
+mcp_call 133 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P10_PLAN\"}}" >/tmp/p10-b.out 2>&1 &
+PID_B=$!
+wait $PID_A; wait $PID_B
+# Decode each. One should be 'succeeded' / 'partial' / 'aborted', the other either
+# the same OR a clean PLAN_NOT_FOUND (cache deleted by the winner). Neither should
+# be 5xx, undefined status, or a shape with mixed steps.
+RA=$(cat /tmp/p10-a.out | text_of 2>/dev/null || echo '{}')
+RB=$(cat /tmp/p10-b.out | text_of 2>/dev/null || echo '{}')
+SA=$(echo "$RA" | field_of status)
+SB=$(echo "$RB" | field_of status)
+EA=$(echo "$RA" | field_of error)
+EB=$(echo "$RB" | field_of error)
+# Acceptable outcomes for each: status in {succeeded,partial,aborted} OR error=PLAN_NOT_FOUND.
+acceptable() {
+  case "$1" in
+    succeeded|partial|aborted) return 0 ;;
+    *) [ "$2" = "PLAN_NOT_FOUND" ] && return 0 || return 1 ;;
+  esac
+}
+if acceptable "$SA" "$EA" && acceptable "$SB" "$EB"; then
+  pass "P10: concurrent applies both produced clean outcomes (A=$SA${EA:+/$EA}, B=$SB${EB:+/$EB})"
+else
+  fail "P10 concurrent isolation" "A status=$SA error=$EA; B status=$SB error=$EB — expected each to be succeeded/partial/aborted/PLAN_NOT_FOUND"
+fi
+
+echo "== P10: Zoho connect without api_domain → CONFIG_ERROR =="
+# configuration-philosophy tier-2 fail-at-boot: previously the adapter silently fell back
+# to zohoapis.com, breaking every non-com DC customer.
+R=$(mcp_call 134 'tools/call' '{"name":"connect_crm","arguments":{"crm":"zoho","org_label":"p10-noapidomain","is_demo":true,"writable_org_ids":[],"refresh_token":"fake","dc":"eu"}}' | text_of)
+P10_ZERR=$(echo "$R" | field_of error)
+[ "$P10_ZERR" = "CONFIG_ERROR" ] && pass "P10: zoho connect without api_domain refused with CONFIG_ERROR" || fail "P10 zoho api_domain enforcement" "got error='$P10_ZERR' (expected CONFIG_ERROR)"
 
 # ---- 15. health ----
 echo "== /health =="
@@ -459,6 +588,17 @@ process.stdout.write(JSON.stringify(args));
   SF_STATUS=$(echo "$R" | field_of status)
   [ "$SF_STATUS" = "succeeded" ] && pass "live apply succeeded" || fail "live apply" "$R"
 
+  # P9: apply response only carries {status, step_count, run_id} — not the step array.
+  # Pull the steps from the run ledger via get_run and confirm grant_field_visibility ran.
+  RUN_DETAIL=$(mcp_call 531 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$SF_RUN\"}}" | text_of)
+  GRANT_STEP=$(echo "$RUN_DETAIL" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='grant_field_visibility');
+if(!s){process.stdout.write('missing');process.exit(0)}
+process.stdout.write(s.status==='succeeded' ? 'succeeded' : ('other:'+s.status));
+")
+  [ "$GRANT_STEP" = "succeeded" ] && pass "P9: apply ran grant_field_visibility step (succeeded)" || fail "P9 grant step ran" "got '$GRANT_STEP' (the create_field succeeded but FLS step missing means the field is invisible to non-admins)"
+
   # Verify via re-inspect — the new field should appear
   R=$(mcp_call 54 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$SF_CONN\"}}" | text_of)
   FOUND=$(echo "$R" | node -e "
@@ -468,6 +608,38 @@ process.stdout.write(f ? 'yes' : 'no');
 ")
   [ "$FOUND" = "yes" ] && pass "live: probe field exists in SFDC" || fail "probe field exists after apply" "got $FOUND"
 
+  # P9 PRIMARY GATE: the PROVISIONER_PERMSET ('Prov_Provisioned') must grant Read+Edit
+  # on Lead.prov_smoke_field__c. FieldPermissions IS the FLS truth-source — if this row
+  # is absent, no user except admins (who see everything via Profile) can SOQL the field.
+  # Tooling query as admin reads the metadata; the field-visibility outcome is decided
+  # right here, regardless of which user runs a later SELECT.
+  FLS_QUERY="SELECT+Field,PermissionsRead,PermissionsEdit+FROM+FieldPermissions+WHERE+Parent.Name='Prov_Provisioned'+AND+Field='Lead.prov_smoke_field__c'"
+  FLS_ROWS=$(sf api request rest "/services/data/v62.0/query?q=$FLS_QUERY" --target-org shane-dev 2>/dev/null | node -e "
+const d=JSON.parse(require('fs').readFileSync(0,'utf8'));
+const r=(d.records||[])[0];
+if(!r){process.stdout.write('zero-rows');process.exit(0)}
+process.stdout.write(r.PermissionsRead && r.PermissionsEdit ? 'read-edit' : ('partial:'+JSON.stringify(r)));
+")
+  [ "$FLS_ROWS" = "read-edit" ] && pass "P9: FieldPermissions row for prov_smoke_field__c exists with Read+Edit" || fail "P9 FieldPermissions grant" "got '$FLS_ROWS' (this is the bug P9 was written to catch)"
+
+  # P9 STRONGER GATE (optional, runs only when SF_PROBER_ALIAS is set in env):
+  # Probe the field by SELECTing it AS the prober user. If FLS is correctly granted,
+  # the query succeeds; if not, SFDC returns "No such column 'prov_smoke_field__c'".
+  # One-time setup to enable: `sf org create user --definition-file config/prober-user-def.json \
+  #   --target-org shane-dev --set-alias shane-dev-prober` (alias must auth as that user).
+  # Then `sf org assign permset --name Prov_Provisioned --on-behalf-of <prober-username> --target-org shane-dev`
+  # The admin alias's auth context handles the on-behalf-of grant.
+  if [ -n "${SF_PROBER_ALIAS:-}" ]; then
+    PROBER_OUT=$(sf data query --target-org "$SF_PROBER_ALIAS" --query "SELECT prov_smoke_field__c FROM Lead LIMIT 0" --json 2>&1 || true)
+    if echo "$PROBER_OUT" | grep -q "No such column"; then
+      fail "P9 prober SOQL probe — FLS NOT granted to non-admin" "the exact bug P9 was built to prevent: field exists, but a Standard User can't see it"
+    else
+      pass "P9: prober ($SF_PROBER_ALIAS) can SOQL the field (FLS works end-to-end)"
+    fi
+  else
+    echo "    (SF_PROBER_ALIAS not set — primary FieldPermissions gate above is the live check; strong-gate prober probe skipped.)"
+  fi
+
   # Idempotency: a second plan should diff to noop on the field
   R=$(mcp_call 55 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$SF_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$SF_DELTA}}" | text_of)
   NOOP_FIELD=$(echo "$R" | node -e "
@@ -476,6 +648,16 @@ const s=(d.steps||[]).find(x=>x.operation==='create_field' && x.payload?.api_nam
 process.stdout.write(s?.diff || 'missing');
 ")
   [ "$NOOP_FIELD" = "noop" ] && pass "live: second plan shows noop on existing field (idempotent)" || fail "idempotent re-plan" "got '$NOOP_FIELD'"
+
+  # P9 idempotency: the grant_field_visibility step ALSO noops on re-plan, because the
+  # FieldPermissions row was created on the first apply (snapshot.permset_field_perms
+  # includes the field, so planSpec sees nothing missing).
+  NOOP_GRANT=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='grant_field_visibility');
+process.stdout.write(s?.diff || 'missing');
+")
+  [ "$NOOP_GRANT" = "noop" ] && pass "P9: second plan shows noop on grant_field_visibility (idempotent FLS)" || fail "P9 idempotent FLS re-plan" "got '$NOOP_GRANT'"
 
   # Teardown — verify the field is removed
   R=$(mcp_call 56 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$SF_RUN\"}}" | text_of)
@@ -489,6 +671,15 @@ const f=(d.snapshot?.fields_lead||[]).find(x=>x.DeveloperName==='prov_smoke_fiel
 process.stdout.write(f ? 'still-there' : 'gone');
 ")
   [ "$GONE" = "gone" ] && pass "live: probe field removed by teardown" || fail "probe field removed" "got $GONE"
+
+  # P9: after teardown, the FieldPermissions row for prov_smoke_field__c is gone too —
+  # the permset's redeployed-without-this-field. (The permset itself still exists; only
+  # this run's field entries got removed.)
+  FLS_AFTER_TDN=$(sf api request rest "/services/data/v62.0/query?q=$FLS_QUERY" --target-org shane-dev 2>/dev/null | node -e "
+const d=JSON.parse(require('fs').readFileSync(0,'utf8'));
+process.stdout.write((d.records||[]).length === 0 ? 'gone' : 'still-there');
+")
+  [ "$FLS_AFTER_TDN" = "gone" ] && pass "P9: FieldPermissions row removed by teardown (permset redeployed without field)" || fail "P9 FieldPermissions teardown" "got '$FLS_AFTER_TDN'"
 else
   echo "  (SF_LIVE=0 — live SFDC assertions skipped. Run 'SF_LIVE=1 bash scripts/smoke-p0.sh' to exercise.)"
 fi

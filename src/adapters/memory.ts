@@ -12,6 +12,13 @@
 //                                     (tests no-retry path: 1 attempt)
 //   test__throw_then_succeed       — throws BoundaryError:transient on first call,
 //                                     succeeds on retry (tests success-after-retry: 2 attempts)
+//   test__throw_boundary_rate_limit (P11) — always throws BoundaryError:rate_limit
+//                                            with retryAfterSec=0 (tests rate_limit retry path
+//                                            without slowing the smoke; covers the retryAfterCapMs
+//                                            branch added in P10)
+//   test__throw_boundary_rejected  (P11) — always throws BoundaryError:rejected (4xx-rejected)
+//                                          (tests no-retry + permanent-failure-cache path,
+//                                          a typed kind defined but never exercised pre-P11)
 // Prefixes only ever fire against the memory adapter; real CRMs never see these.
 
 import type { ProvisionSpec } from "../core/spec.ts";
@@ -68,6 +75,15 @@ function isSilentSuccessTest(apiName: string): boolean {
 function maybeThrowForTest(connId: string, apiName: string): void {
   if (apiName.startsWith("test__throw_boundary_transient")) {
     throw new BoundaryError({ provider: "memory", kind: "transient", message: "synthetic transient error for retry smoke" });
+  }
+  if (apiName.startsWith("test__throw_boundary_rate_limit")) {
+    // retryAfterSec=0 → falls through to exponential jitter; smoke stays fast.
+    // (We're testing that rate_limit is retried at all; the specific delay math is
+    //  covered by scripts/test-retry-after.mjs against computeDelay directly.)
+    throw new BoundaryError({ provider: "memory", kind: "rate_limit", message: "synthetic rate-limit error for retry smoke", retryAfterSec: 0 });
+  }
+  if (apiName.startsWith("test__throw_boundary_rejected")) {
+    throw new BoundaryError({ provider: "memory", kind: "rejected", message: "synthetic 4xx-rejected error", vendorCode: "SYNTHETIC_REJECTED" });
   }
   if (apiName.startsWith("test__throw_data_error")) {
     throw new DataError({ message: "synthetic data error for no-retry smoke", vendorCode: "SYNTHETIC_DATA_ERROR" });

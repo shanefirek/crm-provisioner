@@ -41,11 +41,11 @@ A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (
 | Teardown_run reversal of a prior run's steps | ✅ tested both adapters (with honest residue notes) |
 | Pre-commit smoke gate (requires live dev server) | ✅ blocks bad commits |
 
-**Smoke at HEAD:**
-- Default (no live CRM env): **46/46**
-- `SF_LIVE=1`: **55/55** (adds 9 SFDC end-to-end)
-- `ZOHO_LIVE=1`: **64/64** (adds Zoho end-to-end + 4 template viability checks)
-- `SF_LIVE=1 ZOHO_LIVE=1`: full 64+9
+**Smoke at HEAD (post P9/P10/P11 hardening pass, 2026-06-13):**
+- Default (no live CRM env): **79/79** — includes P11's 2 standalone .mjs boundary tests (`scripts/test-classifiers.mjs`, `scripts/test-overlay.mjs`) invoked from the smoke + the P10/P11 memory-adapter rate_limit/rejected exercises
+- `SF_LIVE=1`: **92/92** (adds 13 SFDC end-to-end — was 9 pre-P9; +4 FLS-pairing assertions)
+- `ZOHO_LIVE=1`: **97/97** (adds Zoho end-to-end + 4 template viability checks)
+- `SF_LIVE=1 ZOHO_LIVE=1`: **110/110**
 
 ## What's NOT working / explicitly deferred
 
@@ -91,6 +91,18 @@ PORT=8788 SF_LIVE=1 ZOHO_LIVE=1 bash scripts/smoke-p0.sh  # 64+ assertions
 lsof -nP -iTCP:8788 -sTCP:LISTEN          # find squatters
 kill -9 <pid>                              # if workerd shows up, force-kill
 ```
+
+**One-time setup for the P9 strong-gate (optional):** the SF_LIVE smoke's primary FLS gate queries `FieldPermissions` via Tooling REST as admin — that's the FLS truth-source and always runs. The optional stronger gate proves a non-admin user can SOQL the provisioned field. To enable:
+```bash
+# Create the prober user in shane-dev (one-time; alias auto-auths as that user)
+sf org create user --target-org shane-dev \
+  --definition-file config/prober-user-def.json \
+  --set-alias shane-dev-prober
+
+# Pass the alias into smoke (every run, or persist in .dev.vars)
+SF_PROBER_ALIAS=shane-dev-prober SF_LIVE=1 bash scripts/smoke-p0.sh
+```
+The smoke skips the prober-probe assertion when `SF_PROBER_ALIAS` is unset — FieldPermissions stays the live gate either way.
 
 ## How the MCP works (for the agent-side perspective)
 
