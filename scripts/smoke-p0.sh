@@ -48,8 +48,8 @@ echo "== tools/list =="
 RESP=$(mcp_call 1 'tools/list' '{}')
 [ -n "$RESP" ] && pass "tools/list returned" || fail "tools/list returned" "empty"
 TOOL_COUNT=$(echo "$RESP" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).result?.tools||[]).length))" 2>/dev/null)
-[ "$TOOL_COUNT" = "7" ] && pass "exactly 7 tools registered" || fail "exactly 7 tools registered" "got $TOOL_COUNT"
-for t in list_templates connect_crm inspect_instance validate_spec plan apply get_run; do
+[ "$TOOL_COUNT" = "8" ] && pass "exactly 8 tools registered (P1)" || fail "exactly 8 tools registered (P1)" "got $TOOL_COUNT"
+for t in list_templates connect_crm inspect_instance validate_spec plan apply get_run teardown_run; do
   echo "$RESP" | node -e "
 const r=JSON.parse(require('fs').readFileSync(0));
 const found=(r.result?.tools||[]).find(x=>x.name==='$t');
@@ -76,11 +76,19 @@ R=$(mcp_call 2 'tools/call' '{"name":"list_templates","arguments":{}}' | text_of
 TID=$(echo "$R" | field_of templates.0.id)
 [ "$TID" = "toy-sales" ] && pass "toy-sales template present" || fail "toy-sales template present" "got '$TID'"
 
-# ---- 3. connect_crm ----
-echo "== connect_crm =="
-R=$(mcp_call 3 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"smoke"}}' | text_of)
+# ---- 3. connect_crm (demo, writable) ----
+echo "== connect_crm (demo, writable) =="
+R=$(mcp_call 3 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"smoke","is_demo":true,"api_domain":"memory://smoke","writable_org_ids":["memory://smoke"]}}' | text_of)
 CONN=$(echo "$R" | field_of connection_id)
+IS_DEMO=$(echo "$R" | field_of is_demo)
 [ -n "$CONN" ] && pass "got connection_id" || fail "got connection_id" "empty"
+[ "$IS_DEMO" = "true" ] && pass "connection persisted is_demo=true" || fail "is_demo=true persisted" "got $IS_DEMO"
+
+# Also create a NON-demo connection for the writability-refusal test below.
+echo "== connect_crm (non-demo) =="
+R=$(mcp_call 31 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"non-demo","is_demo":false}}' | text_of)
+CONN_NONDEMO=$(echo "$R" | field_of connection_id)
+[ -n "$CONN_NONDEMO" ] && pass "got non-demo connection_id" || fail "got non-demo connection_id" "empty"
 
 # ---- 4. inspect_instance ----
 echo "== inspect_instance =="
@@ -152,7 +160,43 @@ process.stdout.write(String((j.steps||[]).filter(s=>s.diff==='noop').length));
 ")
 [ "$NOOPS" -ge 1 ] && pass "second plan shows noop steps (idempotent)" || fail "second plan shows noop steps" "got $NOOPS"
 
-# ---- 12. health ----
+# ---- 12. hardening: plan reports destructive_count (zero for memory adapter, but the field must exist) ----
+echo "== plan reports destructive_count =="
+DC=$(echo "$R" | field_of destructive_count)
+[ "$DC" = "0" ] && pass "plan reports destructive_count=0 (memory adapter is non-destructive)" || fail "plan reports destructive_count field" "got '$DC'"
+
+# ---- 13. hardening: apply refused on non-demo connection ----
+echo "== hardening: non-demo connection refuses apply =="
+# Need a fresh plan against the non-demo connection
+R=$(mcp_call 13 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN_NONDEMO\",\"template_ref\":\"toy-sales\",\"delta\":$LEGAL}}" | text_of)
+NONDEMO_PLAN=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 14 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$NONDEMO_PLAN\"}}" | text_of)
+ERR=$(echo "$R" | field_of error)
+[ "$ERR" = "CONNECTION_NOT_WRITABLE" ] && pass "apply on non-demo connection refused with CONNECTION_NOT_WRITABLE" || fail "non-demo refusal" "error=$ERR"
+
+# ---- 14. teardown_run reverses the original demo run ----
+echo "== teardown_run =="
+# Re-inspect to confirm state exists before teardown
+PRE=$(mcp_call 15 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$CONN\"}}" | text_of)
+PRE_FIELDS=$(echo "$PRE" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).snapshot?.fields||[]).length))")
+
+R=$(mcp_call 16 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$RUN\"}}" | text_of)
+OK=$(echo "$R" | field_of ok)
+TD_RUN=$(echo "$R" | field_of teardown_run_id)
+[ "$OK" = "true" ] && pass "teardown_run ok" || fail "teardown_run ok" "$R"
+[ -n "$TD_RUN" ] && pass "teardown returned new run_id" || fail "teardown new run_id" "empty"
+
+# Verify state was reversed
+POST=$(mcp_call 17 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$CONN\"}}" | text_of)
+POST_FIELDS=$(echo "$POST" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).snapshot?.fields||[]).length))")
+[ "$POST_FIELDS" = "0" ] && pass "teardown emptied snapshot.fields ($PRE_FIELDS → 0)" || fail "teardown emptied snapshot.fields" "$PRE_FIELDS → $POST_FIELDS"
+
+# Teardown run is queryable via get_run and links back via teardown_of_run
+R=$(mcp_call 18 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$TD_RUN\"}}" | text_of)
+TD_OF=$(echo "$R" | field_of run.teardown_of_run)
+[ "$TD_OF" = "$RUN" ] && pass "teardown run's teardown_of_run links to original" || fail "teardown_of_run link" "got '$TD_OF' expected '$RUN'"
+
+# ---- 15. health ----
 echo "== /health =="
 H=$(curl -sS "$BASE/health")
 echo "$H" | grep -q '"phase":"P0"' && pass "/health says P0" || fail "/health says P0" "$H"

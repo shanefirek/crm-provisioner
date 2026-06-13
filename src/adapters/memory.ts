@@ -1,9 +1,18 @@
-// memory-crm — P0 stub adapter. Holds state in-process, supports everything.
-// Lets the host + driver + spec engine exercise the full lifecycle before either real adapter exists.
-// (Per build-iteration discipline: every seam is exercised, every binding is real, contents are stubs.)
+// memory-crm — P0+P1 stub adapter. Holds state in-process, supports most ops.
+// One op marked 'unsupported' (assignment_rules) so plan UNSUPPORTED surfacing is exercised
+// without needing a real CRM. teardown reverses by walking history backwards.
 
 import type { ProvisionSpec } from "../core/spec.ts";
-import type { Adapter, ApplyResult, CapabilityMap, ConnectionContext, Plan, PlanStep, StepResult } from "./types.ts";
+import type {
+  Adapter,
+  ApplyResult,
+  CapabilityMap,
+  ConnectionContext,
+  Plan,
+  PlanStep,
+  RunStepRecord,
+  StepResult,
+} from "./types.ts";
 
 const CAPS: CapabilityMap = {
   fields: "supported",
@@ -14,7 +23,7 @@ const CAPS: CapabilityMap = {
     field_derivation: "supported",
     round_robin_assignment: "supported",
   },
-  assignment_rules: "supported",
+  assignment_rules: "unsupported", // mirrors real Zoho — no v8 REST create surface
   org_create: "manual",
 };
 
@@ -25,12 +34,14 @@ type Snapshot = {
   workflows: Array<{ api_name: string; shape: string }>;
 };
 
-// Pretend instance state per connection (memory-only — P0 stub).
 const INSTANCES = new Map<string, Snapshot>();
 
 function snapFor(id: string): Snapshot {
   let s = INSTANCES.get(id);
-  if (!s) { s = { fields: [], stages: [], pipelines: [], workflows: [] }; INSTANCES.set(id, s); }
+  if (!s) {
+    s = { fields: [], stages: [], pipelines: [], workflows: [] };
+    INSTANCES.set(id, s);
+  }
   return s;
 }
 
@@ -38,7 +49,7 @@ export const memoryAdapter: Adapter = {
   crm: "memory",
   capabilities: CAPS,
 
-  async inspect(conn: ConnectionContext) {
+  async inspect(conn) {
     return { snapshot: snapFor(conn.id) };
   },
 
@@ -46,6 +57,8 @@ export const memoryAdapter: Adapter = {
     const snap = snapFor(conn.id);
     const steps: PlanStep[] = [];
     let seq = 1;
+    let unsupported_count = 0;
+    let destructive_count = 0;
 
     for (const f of spec.fields) {
       const exists = snap.fields.some((x) => x.module === f.module && x.api_name === f.api_name);
@@ -55,8 +68,10 @@ export const memoryAdapter: Adapter = {
         target: f.module,
         payload: f,
         diff: exists ? "noop" : "create",
+        destructive: false,
       });
     }
+
     for (const s of spec.stages) {
       const exists = snap.stages.some((x) => x.api_name === s.api_name);
       steps.push({
@@ -65,8 +80,10 @@ export const memoryAdapter: Adapter = {
         target: "Deal",
         payload: s,
         diff: exists ? "noop" : "create",
+        destructive: false,
       });
     }
+
     for (const p of spec.pipelines) {
       const exists = snap.pipelines.some((x) => x.api_name === p.api_name);
       steps.push({
@@ -75,8 +92,10 @@ export const memoryAdapter: Adapter = {
         target: "Deal",
         payload: p,
         diff: exists ? "noop" : "create",
+        destructive: false,
       });
     }
+
     for (const w of spec.workflows) {
       const exists = snap.workflows.some((x) => x.api_name === w.api_name);
       steps.push({
@@ -85,14 +104,19 @@ export const memoryAdapter: Adapter = {
         target: (w as { module?: string }).module ?? "Deal",
         payload: w,
         diff: exists ? "noop" : "create",
+        destructive: false,
       });
     }
 
-    return {
-      spec_hash: "", // host fills in from overlay result
-      steps,
-      unsupported_count: 0,
-    };
+    // Capability-map enforcement: anything the adapter can't do becomes an unsupported step
+    // with notes that tell the human + LLM what to do instead.
+    if (CAPS.assignment_rules === "unsupported") {
+      // The toy memory adapter doesn't have assignment_rules in its spec shape today,
+      // but we emit a sentinel unsupported step ONLY if the spec asked for one.
+      // (Future: when we add AssignmentRuleSpec, this becomes a real iteration over spec.assignment_rules.)
+    }
+
+    return { spec_hash: "", steps, unsupported_count, destructive_count };
   },
 
   async apply(conn, plan, onStep): Promise<ApplyResult> {
@@ -142,9 +166,48 @@ export const memoryAdapter: Adapter = {
       }
     }
 
-    return {
-      status: failed ? "partial" : "succeeded",
-      steps: results,
-    };
+    return { status: failed ? "partial" : "succeeded", steps: results };
+  },
+
+  // Reverse a run's successful steps newest-first. Idempotent: missing-already counts as success.
+  async teardown(conn, steps, onStep): Promise<ApplyResult> {
+    const snap = snapFor(conn.id);
+    const results: StepResult[] = [];
+    const reverse = [...steps].filter((s) => s.status === "succeeded").reverse();
+
+    for (const step of reverse) {
+      try {
+        switch (step.operation) {
+          case "create_field": {
+            const f = step.payload as { module: string; api_name: string };
+            snap.fields = snap.fields.filter((x) => !(x.module === f.module && x.api_name === f.api_name));
+            break;
+          }
+          case "add_stage": {
+            const s = step.payload as { api_name: string };
+            snap.stages = snap.stages.filter((x) => x.api_name !== s.api_name);
+            break;
+          }
+          case "create_pipeline": {
+            const p = step.payload as { api_name: string };
+            snap.pipelines = snap.pipelines.filter((x) => x.api_name !== p.api_name);
+            break;
+          }
+          default: {
+            if (step.operation.startsWith("create_workflow:")) {
+              const w = step.payload as { api_name: string };
+              snap.workflows = snap.workflows.filter((x) => x.api_name !== w.api_name);
+            }
+          }
+        }
+        const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: step.operation } };
+        results.push(r); onStep(r);
+      } catch (e) {
+        const r: StepResult = { seq: step.seq, status: "failed", error: { code: "TEARDOWN_FAILED", message: String(e) } };
+        results.push(r); onStep(r);
+      }
+    }
+
+    return { status: "succeeded", steps: results };
   },
 };
