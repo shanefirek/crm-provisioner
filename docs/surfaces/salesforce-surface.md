@@ -1,12 +1,14 @@
-# Salesforce — API Surface (api-ingest S0)
+# Salesforce — API Surface
 
-**Probed:** 2026-06-12 against `shane-dev` (Developer Edition, `orgfarm-e843df8348-dev-ed.develop.my.salesforce.com`, API v62.0). Method: raw REST via `sf api request rest` (signed passthrough, unmodified vendor envelopes) + Metadata API via `sf project deploy/retrieve`. All fixtures in `fixtures/salesforce/`.
+**Probed:** 2026-06-12 (S0) → expanded 2026-06-13 with P2 live-adapter findings. `shane-dev` (Developer Edition, `orgfarm-e843df8348-dev-ed.develop.my.salesforce.com`, API v62.0). Method: raw REST via `sf api request rest` (signed passthrough, unmodified vendor envelopes) + Metadata API via `sf project deploy/retrieve`. All fixtures in `fixtures/salesforce/`.
 
 ## Capability map (sales-function spec vocabulary)
 
 | Operation | Mechanism | C/R/U/D | Quirks observed | Verdict |
 |---|---|---|---|---|
 | Custom field (create) | Tooling REST `POST /tooling/sobjects/CustomField` | C R U D | **Two-step op:** created field has NO field-level security — invisible to ALL profiles via API until a PermissionSet grants it (probed: SOQL returns `No such column`). Adapter must pair every field-create with a permset fieldPermissions entry + assignment | ✅ API (+ mandatory FLS step) |
+| Custom field (delete) | `destructiveChanges.xml` Metadata deploy | D | **Tooling REST DELETE on CustomField returns `INSUFFICIENT_ACCESS_ON_CROSS_REFERENCE_ENTITY`** unless FLS is set up first. Also: `sf api request rest --method DELETE` breaks on CLI 2.x ("No 'mode' found in 'body' entry"). Canonical and bulletproof path is destructiveChanges — sidesteps both FLS + dependency walls. Adapter teardown does this | ✅ Metadata API |
+| Custom field (list) | Tooling SOQL `SELECT Id, DeveloperName FROM CustomField WHERE TableEnumOrId='Lead'` | R | **Cannot `SELECT FullName` in a multi-row query** — `MALFORMED_QUERY: Result size: N`. Tooling restricts FullName/Metadata projections to single-row results. Adapter selects only Id+DeveloperName and derives FullName by convention (`Lead.{DeveloperName}__c`) | ✅ API (with the projection restriction) |
 | Field visibility (FLS) | Metadata deploy `PermissionSet` + `sf org assign permset` | C R U | Assignment is per-user/profile; adapter should ship ONE permset per provisioned spec and assign to the connecting user | ✅ API |
 | Pipeline stages (Opportunity) | Metadata deploy `StandardValueSet:OpportunityStage` | C R U ~D | NOT REST-addressable (`INVALID_TYPE_FOR_OPERATION` on tooling GET-by-id). **Deploy omitting a value DEACTIVATES it, never deletes** (probed: stage survives restore with `IsActive:false`). Plan/diff must model deactivate-not-delete; teardown leaves residue | ✅ Metadata API |
 | Stage read | REST `query FROM OpportunityStage` | R | Clean; `ApiName`, `IsActive`, `DefaultProbability` | ✅ API |
@@ -21,7 +23,9 @@
 1. **Success = JSON object; error = JSON ARRAY** of `{message, errorCode, fields[]}`. A naive `response.errorCode` check misses every error. (Fixtures: `create-customfield-response.json` vs `create-customfield-duplicate-error.json`.)
 2. Error codes are typed and instructive: `DUPLICATE_DEVELOPER_NAME` names the colliding field — good re-prompt material for validate-layer messages.
 3. Metadata deploys are **async** (seconds): `sf project deploy start` polls internally; a raw-API adapter must poll `deployRequest` — confirms the architecture.md risk-3 decision that `apply` is async with `get_run` from day 0.
-4. `sf org display` redacts access tokens; `sf api request rest` is the sanctioned raw-probe path (keeps token out of scripts entirely).
+4. **Auth path: `sf org display` REDACTS access tokens on stdout** (CLI 2.x security feature) — the visible token starts with `[REDAC` and length 54 chars. The real 269-char token lives in `~/.sfdx/{username}.json` but is **encrypted with a machine-local key** — direct Bearer fetch with that token returns `INVALID_AUTH_HEADER`. **The only working programmatic auth for P2 is shelling out to `sf api request rest`**, which uses the CLI's internal decrypted token. P3 will replace this with a proper OAuth web flow + token storage.
+5. **`sf api request rest --method DELETE` is broken on CLI 2.x** ("No 'mode' found in 'body' entry"). The CLI demands a `mode:raw|formdata` body wrapper even for DELETE-without-body. Workaround: don't use it — use `destructiveChanges` deploy for any metadata deletion, which is the canonical SFDC pattern anyway.
+6. **Flow metadata requires `locationX` AND `locationY` on the `<start>` element AND every node.** Canvas coordinates as mandatory metadata; the docs don't lead with this. Missing → `Required field is missing: locationX`. Adapter always emits coords (defaulted to 176/287 for record-update nodes, 176/0 for start).
 
 ## Auth
 
@@ -37,4 +41,6 @@ OAuth web flow standard; S0 used CLI-managed auth. For the Worker: standard auth
 
 ## Verdict summary for the spec engine
 
-Everything in the v1 sales-function vocabulary is provisionable: fields + FLS (Tooling/Metadata), stages (Metadata, deactivate-semantics), assignment rules (Metadata, whole-file), flows/alerts (Metadata, coords required). The adapter is a **metadata-package compiler + a Tooling client + a permset generator**, all async-aware. Architecture risk #3 (deploy latency → async apply) CONFIRMED. No `❌ manual` on the critical path except one-time Dev Hub enablement for scratch orgs (P2).
+Everything in the v1 sales-function vocabulary is provisionable: fields + FLS (Tooling/Metadata), stages (Metadata, deactivate-semantics), assignment rules (Metadata, whole-file), flows/alerts (Metadata, coords required), teardown via destructiveChanges. The adapter is a **metadata-package compiler + a Tooling client + a permset generator**, all async-aware. Architecture risk #3 (deploy latency → async apply) CONFIRMED. No `❌ manual` on the critical path except one-time Dev Hub enablement for scratch orgs (P2.5 future).
+
+Verified live end-to-end in P2: a single-field delta plans, applies, idempotently re-plans to noop, and tears down cleanly. All 9 SFDC assertions in the SF_LIVE smoke pass.

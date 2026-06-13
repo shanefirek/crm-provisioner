@@ -435,6 +435,23 @@ const s=(d.steps||[]).find(x=>x.operation==='create_workflow:round_robin_assignm
 process.stdout.write((s?.notes||'').includes('Deluge') ? 'yes' : 'no');
 ")
   [ "$RR_NOTE" = "yes" ] && pass "live Zoho: round_robin still UNSUPPORTED with Deluge guidance note" || fail "round_robin manual note" "got $RR_NOTE"
+
+  # ===== Vertical template viability against live Zoho =====
+  # plan-only (not apply) for all 4 verticals — viability check that field types
+  # and stage shapes resolve cleanly through the spec engine + Zoho adapter
+  # without errors. Apply-and-teardown for verticals is too noisy for the smoke
+  # (adds ~3 stages * 4 templates * ~15s each), so we verify the PLAN passes
+  # validation + diff computation, which catches structural issues.
+  for V in real-estate professional-services hvac-services manufacturing; do
+    R=$(mcp_call 80 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"$V\",\"delta\":{\"spec_version\":0,\"fields\":[],\"stages\":[],\"pipelines\":[],\"workflows\":[]}}}" | text_of)
+    PLAN_OK=$(echo "$R" | field_of plan_id)
+    if [ -n "$PLAN_OK" ]; then
+      pass "live Zoho viability: template '$V' plans cleanly against trial"
+    else
+      ERR=$(echo "$R" | field_of error)
+      fail "live Zoho viability: template '$V'" "no plan_id; error=$ERR"
+    fi
+  done
 else
   echo "  (ZOHO_LIVE=0 — live Zoho assertions skipped. Run 'ZOHO_LIVE=1 bash scripts/smoke-p0.sh' to exercise.)"
 fi
