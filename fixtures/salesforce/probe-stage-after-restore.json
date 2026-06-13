@@ -1,0 +1,14 @@
+{
+  "totalSize": 1,
+  "done": true,
+  "records": [
+    {
+      "attributes": {
+        "type": "OpportunityStage",
+        "url": "/services/data/v62.0/sobjects/OpportunityStage/01JdL00001VfDF3UAN"
+      },
+      "ApiName": "S0 Probe Stage",
+      "IsActive": false
+    }
+  ]
+}

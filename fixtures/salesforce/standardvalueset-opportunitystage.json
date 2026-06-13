@@ -1,0 +1,6 @@
+[
+  {
+    "message": "entity type does not support bulk id query",
+    "errorCode": "INVALID_TYPE_FOR_OPERATION"
+  }
+]

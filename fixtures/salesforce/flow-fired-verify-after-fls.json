@@ -1,0 +1,14 @@
+{
+  "totalSize": 1,
+  "done": true,
+  "records": [
+    {
+      "attributes": {
+        "type": "Lead",
+        "url": "/services/data/v62.0/sobjects/Lead/00QdL00000cNbllUAC"
+      },
+      "LastName": "S0Probe",
+      "S0_Probe_Field__c": "touched-by-flow"
+    }
+  ]
+}

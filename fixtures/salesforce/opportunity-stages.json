@@ -1,0 +1,36 @@
+{
+  "totalSize": 3,
+  "done": true,
+  "records": [
+    {
+      "attributes": {
+        "type": "OpportunityStage",
+        "url": "/services/data/v62.0/sobjects/OpportunityStage/01JdL00001TG2INUA1"
+      },
+      "Id": "01JdL00001TG2INUA1",
+      "ApiName": "Prospecting",
+      "IsActive": true,
+      "DefaultProbability": 10
+    },
+    {
+      "attributes": {
+        "type": "OpportunityStage",
+        "url": "/services/data/v62.0/sobjects/OpportunityStage/01JdL00001TG2IOUA1"
+      },
+      "Id": "01JdL00001TG2IOUA1",
+      "ApiName": "Qualification",
+      "IsActive": true,
+      "DefaultProbability": 10
+    },
+    {
+      "attributes": {
+        "type": "OpportunityStage",
+        "url": "/services/data/v62.0/sobjects/OpportunityStage/01JdL00001TG2IPUA1"
+      },
+      "Id": "01JdL00001TG2IPUA1",
+      "ApiName": "Proposal/Price Quote",
+      "IsActive": true,
+      "DefaultProbability": 75
+    }
+  ]
+}

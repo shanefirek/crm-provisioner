@@ -1,0 +1,6 @@
+[
+  {
+    "message": "\nSELECT LastName,S0_Probe_Field__c,OwnerId FROM Lead\n                ^\nERROR at Row:1:Column:17\nNo such column 'S0_Probe_Field__c' on entity 'Lead'. If you are attempting to use a custom field, be sure to append the '__c' after the custom field name. Please reference your WSDL or the describe call for the appropriate names.",
+    "errorCode": "INVALID_FIELD"
+  }
+]
