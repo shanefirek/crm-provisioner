@@ -84,7 +84,7 @@ export function buildMcpServer(): McpServer {
     "list_templates",
     {
       description:
-        "List available templates. Each entry has id, version, and description. Use list_templates output to choose a base template before authoring a delta against its declared extension points.",
+        "List available templates. Each entry has id, version, description. Templates are versioned data files; the LLM never authors a whole template — it authors a DELTA against one. Current registry: toy-sales@v0 (smoke), real-estate@v1, professional-services@v1, hvac-services@v1, manufacturing@v1. All four verticals share the same extension-point set (fields/stages/pipelines/pipelines[].stages/workflows are appendable; the base is never replaced). Read each template's `extension_points` array before authoring — deltas that touch undeclared paths are REJECTED by validate_spec.",
       inputSchema: {},
     },
     async () => ok(JSON.stringify({ templates: listTemplates() }, null, 2)),
@@ -95,7 +95,7 @@ export function buildMcpServer(): McpServer {
     "connect_crm",
     {
       description:
-        "Register a connection to a CRM instance. MVP rules: every connection must declare is_demo=true to be writable, AND writable_org_ids should list the api_domain(s) this connection is permitted to write to. P0/P1: creates a 'memory' stub (no OAuth). Returns connection_id to pass to every other tool.",
+        "Register a connection to a CRM instance. MVP HARDENING (enforced by apply()): every connection must declare is_demo=true to be writable, AND api_domain must appear in writable_org_ids — non-demo connections are READ-ONLY via inspect_instance, never writable. CRM-specific args: for 'salesforce', P2 reads auth from local `sf` CLI chain (~/.sfdx/{user}.json — token is CLI-encrypted, NEVER from `sf org display`-emitted stdout); for 'zoho', pass refresh_token + dc ('com'|'eu'|'in'|'com.au'). Three crm values: 'memory' (stub, ALL ops supported, in-process state), 'salesforce' (live; see capability map), 'zoho' (live; see capability map). Returns connection_id used by every other tool.",
       inputSchema: {
         crm: z.enum(["memory", "salesforce", "zoho"]).default("memory"),
         org_label: z.string().optional(),
@@ -126,7 +126,7 @@ export function buildMcpServer(): McpServer {
     "inspect_instance",
     {
       description:
-        "Read the current state of the connected CRM scoped to the spec's vocabulary (fields, stages, pipelines, workflows). Always safe — never writes. The model uses this to ground the delta it authors.",
+        "Read the current state of the connected CRM scoped to the spec's vocabulary (fields, stages, pipelines, workflows). ALWAYS SAFE — never writes, hardening rules don't apply. The model SHOULD call this before authoring a delta to ground its choices in the org's actual current state (avoids creating fields that already exist with a different name, choosing stage forecast_categories the org doesn't have, etc.). Snapshot shape is CRM-specific: SFDC returns `fields_lead` + `stages` + `flows`; Zoho returns `fields_lead` + `stages` (with id/probability/forecast_category) + `pipelines` + `stage_field_id` + `default_deals_layout_id`; memory returns the in-process state.",
       inputSchema: { connection_id: z.string() },
     },
     async ({ connection_id }) => {
@@ -143,7 +143,7 @@ export function buildMcpServer(): McpServer {
     "validate_spec",
     {
       description:
-        "Validate a delta against the schema AND the template's declared extension points. Returns either ok=true with the resolved effective spec, or ok=false with instructive errors naming the path and required next step. Never writes.",
+        "Validate a delta against TWO gates before any planning: (1) zod schema (.strict() — unknown keys REJECTED, not silently dropped); (2) the template's declared extension points (delta touching an undeclared path rejected). Returns ok=true with the resolved effective spec_hash, or ok=false with instructive errors naming the json_path and what's required. Use this BEFORE plan() to catch authoring errors without needing a connection. Never writes anywhere.",
       inputSchema: {
         template_ref: z.string().describe("e.g. 'toy-sales@v0' or 'toy-sales'"),
         delta: z.unknown(),
@@ -157,7 +157,7 @@ export function buildMcpServer(): McpServer {
     "plan",
     {
       description:
-        "Validate (template + delta), inspect the connected instance, and compute the diff: create / update / noop / unsupported per step. Each step is also flagged destructive=true when its reverse is lossy. Returns a plan_id that apply() requires. Nothing is written.",
+        "Validate (template + delta), inspect the live CRM, and compute the diff per step: 'create' | 'update' | 'noop' | 'unsupported'. Each step also carries `destructive: bool` (true when reverse is lossy — e.g. SFDC stage deactivate-not-delete) and optional `notes` (e.g. round_robin_assignment in Zoho is 'manual' — note tells the human to paste the canonical Deluge script once in UI). Output includes `unsupported_count` and `destructive_count`. Returns a plan_id (single-use, in-process cache only — re-plan if the server restarts). Nothing is written. Per-CRM adapter knowledge the model should KNOW when authoring deltas: SFDC fields require a paired permset for FLS (handled automatically by the adapter); SFDC stages deactivate-not-delete (residue persists); Zoho fields are visible-by-default; Zoho stages use whole-array-replace semantics (adapter handles the merge); Zoho underscores in stage api_names normalize to spaces (Lead_In → Lead In, adapter normalizes lookups). Workflow shapes: idle_deal_alert (SFDC Flow + Zoho workflow_rule+task; both create supported) / field_derivation (both supported) / round_robin_assignment (SFDC stub Flow, Zoho MANUAL with Deluge instructions in the note).",
       inputSchema: {
         connection_id: z.string(),
         template_ref: z.string(),
@@ -206,7 +206,7 @@ export function buildMcpServer(): McpServer {
     "apply",
     {
       description:
-        "Execute a previously-computed plan. Gated on a valid plan_id. Refuses if the connection is not is_demo, if the connection's api_domain is not on the writable_org_ids allowlist, or if the plan contains destructive steps without confirm_destructive=true. Records a run + per-step rows in Postgres.",
+        "Execute a previously-computed plan. THREE GATES, all checked at the boundary, in order: (1) plan_id must be in cache → else PLAN_NOT_FOUND; (2) connection must be is_demo=true AND api_domain on writable_org_ids → else CONNECTION_NOT_WRITABLE / ORG_NOT_ON_ALLOWLIST; (3) if plan.destructive_count > 0, caller must pass confirm_destructive:true → else DESTRUCTIVE_NOT_CONFIRMED. Records a run + per-step rows + trace_id in Postgres. Returns {run_id, trace_id, status, step_count}. Status 'partial' means at least one step failed — use get_run to see which. SFDC apply is multi-step async (metadata deploys take ~10-30s); Zoho apply is REST-fast but batches stages into one PATCH for whole-array-replace semantics.",
       inputSchema: {
         plan_id: z.string(),
         confirm_destructive: z.boolean().default(false).describe("Must be true when the plan has destructive_count > 0"),
@@ -302,7 +302,7 @@ export function buildMcpServer(): McpServer {
     "get_run",
     {
       description:
-        "Read a run by id, with all its steps in order. Use to verify apply results and to resume a partial run later.",
+        "Read a run by id with all its steps in order. Returns {run: {id, status, trace_id, connection_id, spec_hash, template, teardown_of_run, started_at, finished_at}, steps: [{seq, operation, target, status, result_json, error_code, error_message, destructive}]}. Step status: 'succeeded' | 'failed' | 'skipped_unsupported'. Errors are typed (per the adapter's error-class) — e.g. Zoho returns 'DEPENDENT_MISMATCH' / 'INVALID_DATA' / 'REQUIRED_DATA_NOT_FOUND' with helpful json_path + value pointers, which the LLM can use to re-author the delta. Use this to verify apply results, diagnose partial runs, OR confirm what a teardown_run reversed.",
       inputSchema: { run_id: z.string() },
     },
     async ({ run_id }) => {
@@ -347,7 +347,7 @@ export function buildMcpServer(): McpServer {
     "teardown_run",
     {
       description:
-        "Reverse the successful steps of a previous run, newest-first. Idempotent — already-absent resources count as success. Requires the original run's connection to still be writable (is_demo + allowlist). Records a new run row with teardown_of_run set to the original.",
+        "Reverse the successful steps of a previous run, newest-first. Idempotent — already-absent resources count as success. Requires the original run's connection to still satisfy the writability gate (is_demo + allowlist). Records a NEW run row with teardown_of_run linking back to the original. Per-CRM teardown semantics that callers should expect (some leave residue, honestly recorded): SFDC create_field is reversed via destructiveChanges deploy (clean); SFDC add_stage records 'stage_deactivated_only' (SFDC deactivate-not-delete); Zoho create_field is reversed via DELETE (clean); Zoho add_stage records 'stage_picklist_value_remains' (whole-array PATCH-only); Zoho create_pipeline records 'pipeline_remains_in_layout_residue' (S0 found DELETE returns 400). Use after every demo to leave the org clean for the next session — but check the residue notes in the response.",
       inputSchema: { run_id: z.string() },
     },
     async ({ run_id }) => {

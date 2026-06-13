@@ -6,13 +6,19 @@ CRM-agnostic provisioning engine: natural language → typed `ProvisionSpec` (te
 
 ## Start here
 
+**First read on any cold session: [`docs/session-pickup.md`](./docs/session-pickup.md)** — one page, gets you back to full speed in ~5 minutes (what's working, what's deferred, how to run, recent commits). Then descend below as the task demands.
+
 | File | When to read |
 |---|---|
-| [`docs/iteration-plan.md`](./docs/iteration-plan.md) | Always — current phase, gate, defer column |
+| [`docs/session-pickup.md`](./docs/session-pickup.md) | **FIRST.** Cold-session handoff doc — capabilities, gaps, run-commands, read-order table |
+| [`docs/iteration-plan.md`](./docs/iteration-plan.md) | Current phase, gate, defer column, full per-phase retro chronology |
 | [`docs/architecture.md`](./docs/architecture.md) | Before touching structure; contains the principle audit table |
-| [`docs/decision-log.md`](./docs/decision-log.md) | Why things are the way they are (dated) |
+| [`docs/decision-log.md`](./docs/decision-log.md) | Why things are the way they are (dated, founding decisions + post-MVP pivots) |
+| [`docs/demo-runbook.md`](./docs/demo-runbook.md) | Before any demo. Two scripts (pre-sales / investor) + failure-mode rehearsal |
+| [`docs/surfaces/zoho-surface.md`](./docs/surfaces/zoho-surface.md) + [`docs/surfaces/zoho-deluge-patterns.md`](./docs/surfaces/zoho-deluge-patterns.md) | Before debugging any Zoho plan / apply / workflow issue |
+| [`docs/surfaces/salesforce-surface.md`](./docs/surfaces/salesforce-surface.md) | Before debugging any SFDC plan / apply / teardown issue |
+| [`docs/prior-art-public-app-provisioner.md`](./docs/prior-art-public-app-provisioner.md) | When adding a new adapter OR considering adopt-or-create / drift-detect / reconcile / HubSpot — pre-paid tribal knowledge |
 | `~/projects/gtm-agent/context/principles/INDEX.md` | The governing principles (this repo follows them; they live there) |
-| `~/projects/gtm-agent/context/reference/infra/cloudflare-workers-substrate.md` | Workers gotchas, pre-paid |
 
 ## The one-paragraph architecture
 
