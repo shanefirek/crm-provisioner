@@ -1,8 +1,21 @@
 // memory-crm — P0+P1 stub adapter. Holds state in-process, supports most ops.
 // One op marked 'unsupported' (assignment_rules) so plan UNSUPPORTED surfacing is exercised
 // without needing a real CRM. teardown reverses by walking history backwards.
+//
+// P5 additions: synthetic-throw support for retry-semantics smoke assertions.
+// If a field's api_name has a known test-prefix, the memory adapter throws a
+// specific typed error so the default smoke can exercise retryBoundary without
+// touching a live CRM. The prefixes are:
+//   test__throw_boundary_transient — always throws BoundaryError:transient
+//                                     (tests max-retry path: 5 attempts then fail)
+//   test__throw_data_error         — always throws DataError
+//                                     (tests no-retry path: 1 attempt)
+//   test__throw_then_succeed       — throws BoundaryError:transient on first call,
+//                                     succeeds on retry (tests success-after-retry: 2 attempts)
+// Prefixes only ever fire against the memory adapter; real CRMs never see these.
 
 import type { ProvisionSpec } from "../core/spec.ts";
+import { BoundaryError, DataError, describeThrown, retryBoundary } from "../host/errors.ts";
 import type {
   Adapter,
   ApplyResult,
@@ -35,6 +48,28 @@ type Snapshot = {
 };
 
 const INSTANCES = new Map<string, Snapshot>();
+
+// Per-connection counter for "throw then succeed" — keyed by (conn_id, api_name).
+// Reset implicitly when the connection is dropped (process restart).
+const THEN_SUCCEED_COUNTERS = new Map<string, number>();
+
+function maybeThrowForTest(connId: string, apiName: string): void {
+  if (apiName.startsWith("test__throw_boundary_transient")) {
+    throw new BoundaryError({ provider: "memory", kind: "transient", message: "synthetic transient error for retry smoke" });
+  }
+  if (apiName.startsWith("test__throw_data_error")) {
+    throw new DataError({ message: "synthetic data error for no-retry smoke", vendorCode: "SYNTHETIC_DATA_ERROR" });
+  }
+  if (apiName.startsWith("test__throw_then_succeed")) {
+    const key = `${connId}|${apiName}`;
+    const calls = THEN_SUCCEED_COUNTERS.get(key) ?? 0;
+    THEN_SUCCEED_COUNTERS.set(key, calls + 1);
+    if (calls === 0) {
+      // First call: throw a transient. retryBoundary will call us again — and we'll succeed.
+      throw new BoundaryError({ provider: "memory", kind: "transient", message: "synthetic first-call failure for then-succeed smoke" });
+    }
+  }
+}
 
 function snapFor(id: string): Snapshot {
   let s = INSTANCES.get(id);
@@ -134,34 +169,46 @@ export const memoryAdapter: Adapter = {
         results.push(r); onStep(r); continue;
       }
       try {
-        switch (step.operation) {
-          case "create_field": {
-            const f = step.payload as { module: string; api_name: string };
-            snap.fields.push({ module: f.module, api_name: f.api_name });
-            break;
-          }
-          case "add_stage": {
-            const s = step.payload as { api_name: string };
-            snap.stages.push({ api_name: s.api_name });
-            break;
-          }
-          case "create_pipeline": {
-            const p = step.payload as { api_name: string; stages: string[] };
-            snap.pipelines.push({ api_name: p.api_name, stages: p.stages });
-            break;
-          }
-          default: {
-            if (step.operation.startsWith("create_workflow:")) {
-              const w = step.payload as { api_name: string; shape: string };
-              snap.workflows.push({ api_name: w.api_name, shape: w.shape });
+        // P5: wrap the operation in retryBoundary so BoundaryError:transient is retried
+        // (per the retry decision matrix). DataError and BoundaryError:permanent are not.
+        // The synthetic-throw test prefixes drive this from the smoke gate.
+        await retryBoundary(async () => {
+          switch (step.operation) {
+            case "create_field": {
+              const f = step.payload as { module: string; api_name: string };
+              maybeThrowForTest(conn.id, f.api_name);
+              snap.fields.push({ module: f.module, api_name: f.api_name });
+              break;
+            }
+            case "add_stage": {
+              const s = step.payload as { api_name: string };
+              snap.stages.push({ api_name: s.api_name });
+              break;
+            }
+            case "create_pipeline": {
+              const p = step.payload as { api_name: string; stages: string[] };
+              snap.pipelines.push({ api_name: p.api_name, stages: p.stages });
+              break;
+            }
+            default: {
+              if (step.operation.startsWith("create_workflow:")) {
+                const w = step.payload as { api_name: string; shape: string };
+                snap.workflows.push({ api_name: w.api_name, shape: w.shape });
+              }
             }
           }
-        }
+        }, { baseMs: 1, capMs: 5 }); // tiny delays so smoke runs fast — production callers don't override
+
         const r: StepResult = { seq: step.seq, status: "succeeded", result: { id: `mem-${step.seq}` } };
         results.push(r); onStep(r);
       } catch (e) {
         failed = true;
-        const r: StepResult = { seq: step.seq, status: "failed", error: { code: "STUB_ERROR", message: String(e) } };
+        const d = describeThrown(e);
+        const r: StepResult = {
+          seq: step.seq,
+          status: "failed",
+          error: { code: d.typedCode, message: d.message, attempts: d.attempts },
+        };
         results.push(r); onStep(r);
       }
     }

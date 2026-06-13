@@ -36,7 +36,8 @@ export type StepResult = {
   seq: number;
   status: "succeeded" | "failed" | "skipped_unsupported";
   result?: unknown;
-  error?: { code: string; message: string };
+  /** error.code is the typed-class string (e.g. "BoundaryError:transient", "DataError:DUPLICATE_DATA"). */
+  error?: { code: string; message: string; attempts?: number };
 };
 
 export type ApplyResult = {

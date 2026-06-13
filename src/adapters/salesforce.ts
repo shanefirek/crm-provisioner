@@ -12,6 +12,7 @@
 // - Profile permissions beyond the run's permset
 
 import type { ProvisionSpec, StageSpec, WorkflowShape } from "../core/spec.ts";
+import { BoundaryError, classifySfdcResponse, describeThrown, retryBoundary } from "../host/errors.ts";
 import type {
   Adapter,
   ApplyResult,
@@ -233,10 +234,8 @@ async function createField(conn: ConnectionContext, f: FieldPayload): Promise<un
     body: { FullName: fullName, Metadata: metadata },
   });
   if (status >= 400) {
-    // Bubble up the array-shaped error envelope from S0 surface notes
-    const arr = Array.isArray(body) ? (body as Array<{ errorCode?: string; message?: string }>) : [];
-    const first = arr[0] ?? {};
-    throw Object.assign(new Error(first.message ?? `field create failed (${status})`), { code: first.errorCode ?? `HTTP_${status}` });
+    // P5: classify into typed BoundaryError or DataError. Adapter no longer raw-throws.
+    throw classifySfdcResponse({ status, body });
   }
   return body;
 }
@@ -523,11 +522,17 @@ export const salesforceAdapter: Adapter = {
       if (step.operation === "add_stage" && step.diff !== "noop") stageBatch.push(step.payload as StagePayload);
     }
     if (stageBatch.length) {
-      try { await deployStandardValueSet(conn, stageBatch); }
-      catch (e) { failed = true; for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
-        const r: StepResult = { seq: s.seq, status: "failed", error: { code: "STAGE_BATCH_FAIL", message: String(e) } };
-        results.push(r); onStep(r);
-      } }
+      try {
+        await retryBoundary(() => deployStandardValueSet(conn, stageBatch));
+      }
+      catch (e) {
+        failed = true;
+        const d = describeThrown(e);
+        for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
+          const r: StepResult = { seq: s.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
+          results.push(r); onStep(r);
+        }
+      }
     }
 
     for (const step of plan.steps) {
@@ -552,15 +557,15 @@ export const salesforceAdapter: Adapter = {
 
       try {
         if (step.operation === "create_field") {
-          const res = await createField(conn, step.payload as FieldPayload);
+          // P5: retry boundary errors (5xx, 429); raise DataError immediately.
+          const res = await retryBoundary(() => createField(conn, step.payload as FieldPayload));
           const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
           results.push(r); onStep(r);
         } else if (step.operation.startsWith("create_workflow:")) {
-          await deployFlow(conn, step.payload as WorkflowPayload);
+          await retryBoundary(() => deployFlow(conn, step.payload as WorkflowPayload));
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { flow_deployed: true } };
           results.push(r); onStep(r);
         } else if (step.operation === "create_pipeline") {
-          // No-op on SFDC — recorded for audit.
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { noop: "sfdc-stages-handled-via-svs" } };
           results.push(r); onStep(r);
         } else {
@@ -569,8 +574,8 @@ export const salesforceAdapter: Adapter = {
         }
       } catch (e: unknown) {
         failed = true;
-        const err = e as { code?: string; message?: string };
-        const r: StepResult = { seq: step.seq, status: "failed", error: { code: err.code ?? "STEP_FAILED", message: err.message ?? String(e) } };
+        const d = describeThrown(e);
+        const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
         results.push(r); onStep(r);
       }
     }
@@ -599,7 +604,8 @@ export const salesforceAdapter: Adapter = {
           results.push(r); onStep(r);
         }
       } catch (e) {
-        const r: StepResult = { seq: step.seq, status: "failed", error: { code: "TEARDOWN_FAILED", message: String(e) } };
+        const d = describeThrown(e);
+        const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
         results.push(r); onStep(r);
       }
     }

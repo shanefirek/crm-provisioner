@@ -205,6 +205,52 @@ R=$(mcp_call 18 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"
 TD_OF=$(echo "$R" | field_of run.teardown_of_run)
 [ "$TD_OF" = "$RUN" ] && pass "teardown run's teardown_of_run links to original" || fail "teardown_of_run link" "got '$TD_OF' expected '$RUN'"
 
+# ---- P5: retry-with-backoff via synthetic memory throws ----
+# Three test cases probing the retry decision matrix:
+#  (a) BoundaryError:transient → retried up to maxAttempts (5), then fails
+#  (b) DataError → NOT retried (per the principle: same input → same failure)
+#  (c) Throw-then-succeed → retried once, succeeds; tests retry-recovery
+echo "== P5: typed errors + retry (synthetic memory throws) =="
+P5_DELTA_TRANSIENT='{"spec_version":0,"fields":[{"api_name":"test__throw_boundary_transient_1","label":"x","kind":"text","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+R=$(mcp_call 80 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P5_DELTA_TRANSIENT}}" | text_of)
+P5_PLAN=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 81 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P5_PLAN\"}}" | text_of)
+APPLY_STATUS=$(echo "$R" | field_of status)
+P5_RUN_ID=$(echo "$R" | field_of run_id)
+[ "$APPLY_STATUS" = "partial" ] && pass "P5: apply with transient-throw step → 'partial' (expected; step failed after max retries)" || fail "P5 apply partial" "got $APPLY_STATUS"
+
+R=$(mcp_call 82 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$P5_RUN_ID\"}}" | text_of)
+TRANSIENT_STEP=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field');
+process.stdout.write(JSON.stringify({code:s?.error_code, attempts:s?.attempts}));
+")
+echo "$TRANSIENT_STEP" | grep -q '"code":"BoundaryError:transient"' && pass "P5: transient step error_code = BoundaryError:transient (typed)" || fail "P5 transient error_code" "$TRANSIENT_STEP"
+echo "$TRANSIENT_STEP" | grep -q '"attempts":5' && pass "P5: transient step attempts = 5 (max retries exhausted)" || fail "P5 transient attempts" "$TRANSIENT_STEP"
+
+# (b) DataError — must NOT retry
+P5_DELTA_DATA='{"spec_version":0,"fields":[{"api_name":"test__throw_data_error_1","label":"x","kind":"text","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+R=$(mcp_call 83 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P5_DELTA_DATA}}" | text_of)
+P5_PLAN_D=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 84 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P5_PLAN_D\"}}" | text_of)
+P5_RUN_ID_D=$(echo "$R" | field_of run_id)
+R=$(mcp_call 85 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$P5_RUN_ID_D\"}}" | text_of)
+DATA_STEP=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field');
+process.stdout.write(JSON.stringify({code:s?.error_code, attempts:s?.attempts}));
+")
+echo "$DATA_STEP" | grep -q '"code":"DataError' && pass "P5: data-error step error_code starts with 'DataError' (typed)" || fail "P5 data error_code" "$DATA_STEP"
+echo "$DATA_STEP" | grep -q '"attempts":1' && pass "P5: data-error step attempts = 1 (no retry per matrix)" || fail "P5 data attempts" "$DATA_STEP"
+
+# (c) Throw-then-succeed — retry should recover on attempt 2
+P5_DELTA_TS='{"spec_version":0,"fields":[{"api_name":"test__throw_then_succeed_1","label":"x","kind":"text","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+R=$(mcp_call 86 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P5_DELTA_TS}}" | text_of)
+P5_PLAN_TS=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 87 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P5_PLAN_TS\"}}" | text_of)
+TS_STATUS=$(echo "$R" | field_of status)
+[ "$TS_STATUS" = "succeeded" ] && pass "P5: throw-then-succeed apply succeeds (retry recovered)" || fail "P5 throw-then-succeed" "got $TS_STATUS"
+
 # ---- 15. health ----
 echo "== /health =="
 H=$(curl -sS "$BASE/health")

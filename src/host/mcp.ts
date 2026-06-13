@@ -261,8 +261,8 @@ export function buildMcpServer(): McpServer {
           const planStep = cached.plan.steps[step.seq - 1];
           stepWrites.push(
             client.query(
-              `insert into run_steps (run_id, seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, started_at, finished_at)
-                 values ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, $10, extract(epoch from now())::integer, extract(epoch from now())::integer)`,
+              `insert into run_steps (run_id, seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, attempts, started_at, finished_at)
+                 values ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, $10, $11, extract(epoch from now())::integer, extract(epoch from now())::integer)`,
               [
                 run_id,
                 step.seq,
@@ -274,6 +274,7 @@ export function buildMcpServer(): McpServer {
                 step.error?.code ?? null,
                 step.error?.message ?? null,
                 planStep?.destructive ?? false,
+                step.error?.attempts ?? 1,
               ],
             ),
           );
@@ -314,7 +315,7 @@ export function buildMcpServer(): McpServer {
       if (!r.rows.length) return ok(JSON.stringify({ ok: false, error: "RUN_NOT_FOUND", run_id }));
       const run = r.rows[0];
       const s = await db.query(
-        `select seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive
+        `select seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, attempts
            from run_steps where run_id = $1 order by seq`,
         [run_id],
       );

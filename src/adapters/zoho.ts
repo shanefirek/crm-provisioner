@@ -12,6 +12,7 @@
 //   - assignment_rules: ❌ no v8 REST create surface — UNSUPPORTED.
 
 import type { ProvisionSpec, StageSpec, WorkflowShape } from "../core/spec.ts";
+import { BoundaryError, classifyZohoResponse, describeThrown, retryBoundary } from "../host/errors.ts";
 import type {
   Adapter,
   ApplyResult,
@@ -76,7 +77,7 @@ async function zoho(
   conn: ConnectionContext,
   path: string,
   init: { method?: "GET" | "POST" | "PATCH" | "DELETE"; body?: unknown } = {},
-): Promise<{ status: number; body: unknown }> {
+): Promise<{ status: number; body: unknown; retryAfter?: string | null }> {
   const base = conn.api_domain || "https://www.zohoapis.com";
   const url = `${base}${path}`;
   let token = await mintAccessToken(conn);
@@ -90,7 +91,7 @@ async function zoho(
   const text = await res.text();
   let parsed: unknown = text;
   try { parsed = text.length ? JSON.parse(text) : {}; } catch { /* keep raw */ }
-  return { status: res.status, body: parsed };
+  return { status: res.status, body: parsed, retryAfter: res.headers.get("Retry-After") };
 
   async function doFetch(): Promise<Response> {
     const headers: Record<string, string> = { authorization: `Zoho-oauthtoken ${token}` };
@@ -237,8 +238,8 @@ async function createField(conn: ConnectionContext, f: FieldPayload): Promise<un
       description: f.description,
     }],
   };
-  const { status, body: respBody } = await zoho(conn, `/crm/v8/settings/fields?module=${encodeURIComponent(moduleApi)}`, { method: "POST", body });
-  if (status >= 400) throw new Error(`zoho field create ${status}: ${JSON.stringify(respBody)}`);
+  const { status, body: respBody, retryAfter } = await zoho(conn, `/crm/v8/settings/fields?module=${encodeURIComponent(moduleApi)}`, { method: "POST", body });
+  if (status >= 400) throw classifyZohoResponse({ status, body: respBody, retryAfterHeader: retryAfter });
   return respBody;
 }
 
@@ -314,8 +315,8 @@ async function addStages(conn: ConnectionContext, additions: StageSpec[], snap: 
       pick_list_values: [...existingValues, ...newValues],
     }],
   };
-  const { status, body: respBody } = await zoho(conn, `/crm/v8/settings/fields/${snap.stage_field_id}?module=Deals`, { method: "PATCH", body });
-  if (status >= 400) throw new Error(`zoho stage PATCH ${status}: ${JSON.stringify(respBody)}`);
+  const { status, body: respBody, retryAfter } = await zoho(conn, `/crm/v8/settings/fields/${snap.stage_field_id}?module=Deals`, { method: "PATCH", body });
+  if (status >= 400) throw classifyZohoResponse({ status, body: respBody, retryAfterHeader: retryAfter });
   return respBody;
 }
 
@@ -349,8 +350,8 @@ async function createAutomationTask(conn: ConnectionContext, name: string, subje
       ],
     }],
   };
-  const { status, body: respBody } = await zoho(conn, "/crm/v8/settings/automation/tasks", { method: "POST", body });
-  if (status >= 400) throw new Error(`zoho automation_task create ${status}: ${JSON.stringify(respBody)}`);
+  const { status, body: respBody, retryAfter } = await zoho(conn, "/crm/v8/settings/automation/tasks", { method: "POST", body });
+  if (status >= 400) throw classifyZohoResponse({ status, body: respBody, retryAfterHeader: retryAfter });
   const id = (respBody as { tasks?: Array<{ details?: { id?: string } }> })?.tasks?.[0]?.details?.id;
   if (!id) throw new Error(`zoho automation_task create: no id in response: ${JSON.stringify(respBody)}`);
   return id;
@@ -368,8 +369,8 @@ async function createFieldUpdate(conn: ConnectionContext, name: string, module: 
       value: { type: "field", details: { api_name: sourceField } },
     }],
   };
-  const { status, body: respBody } = await zoho(conn, "/crm/v8/settings/automation/field_updates", { method: "POST", body });
-  if (status >= 400) throw new Error(`zoho field_update create ${status}: ${JSON.stringify(respBody)}`);
+  const { status, body: respBody, retryAfter } = await zoho(conn, "/crm/v8/settings/automation/field_updates", { method: "POST", body });
+  if (status >= 400) throw classifyZohoResponse({ status, body: respBody, retryAfterHeader: retryAfter });
   const id = (respBody as { field_updates?: Array<{ details?: { id?: string } }> })?.field_updates?.[0]?.details?.id;
   if (!id) throw new Error(`zoho field_update create: no id in response: ${JSON.stringify(respBody)}`);
   return id;
@@ -440,8 +441,8 @@ async function createWorkflowRule(conn: ConnectionContext, spec: WorkflowRuleSpe
       conditions: [condition],
     }],
   };
-  const { status, body: respBody } = await zoho(conn, "/crm/v8/settings/automation/workflow_rules", { method: "POST", body });
-  if (status >= 400) throw new Error(`zoho workflow_rule create ${status}: ${JSON.stringify(respBody)}`);
+  const { status, body: respBody, retryAfter } = await zoho(conn, "/crm/v8/settings/automation/workflow_rules", { method: "POST", body });
+  if (status >= 400) throw classifyZohoResponse({ status, body: respBody, retryAfterHeader: retryAfter });
   const id = (respBody as { workflow_rules?: Array<{ details?: { id?: string } }> })?.workflow_rules?.[0]?.details?.id;
   if (!id) throw new Error(`zoho workflow_rule create: no id in response: ${JSON.stringify(respBody)}`);
   return id;
@@ -503,8 +504,8 @@ async function createPipeline(conn: ConnectionContext, p: { api_name: string; la
       maps: stageIds,
     }],
   };
-  const { status, body: respBody } = await zoho(conn, `/crm/v8/settings/pipeline?layout_id=${snap.default_deals_layout_id}`, { method: "POST", body });
-  if (status >= 400) throw new Error(`zoho pipeline POST ${status}: ${JSON.stringify(respBody)}`);
+  const { status, body: respBody, retryAfter } = await zoho(conn, `/crm/v8/settings/pipeline?layout_id=${snap.default_deals_layout_id}`, { method: "POST", body });
+  if (status >= 400) throw classifyZohoResponse({ status, body: respBody, retryAfterHeader: retryAfter });
   return respBody;
 }
 
@@ -536,7 +537,8 @@ export const zohoAdapter: Adapter = {
       } catch (e) {
         failed = true;
         for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
-          const r: StepResult = { seq: s.seq, status: "failed", error: { code: "STAGE_BATCH_FAIL", message: String(e) } };
+          const d = describeThrown(e);
+          const r: StepResult = { seq: s.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
           results.push(r); onStep(r);
         }
       }
@@ -562,19 +564,19 @@ export const zohoAdapter: Adapter = {
       }
       try {
         if (step.operation === "create_field") {
-          const res = await createField(conn, step.payload as FieldPayload);
+          const res = await retryBoundary(() => createField(conn, step.payload as FieldPayload));
           const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
           results.push(r); onStep(r);
         } else if (step.operation === "create_pipeline") {
-          const res = await createPipeline(conn, step.payload as { api_name: string; label: string; stages: string[] }, snap);
+          const res = await retryBoundary(() => createPipeline(conn, step.payload as { api_name: string; label: string; stages: string[] }, snap));
           const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
           results.push(r); onStep(r);
         } else if (step.operation === "create_workflow:idle_deal_alert") {
-          const res = await createIdleDealAlertWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "idle_deal_alert" }>);
+          const res = await retryBoundary(() => createIdleDealAlertWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "idle_deal_alert" }>));
           const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
           results.push(r); onStep(r);
         } else if (step.operation === "create_workflow:field_derivation") {
-          const res = await createFieldDerivationWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "field_derivation" }>);
+          const res = await retryBoundary(() => createFieldDerivationWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "field_derivation" }>));
           const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
           results.push(r); onStep(r);
         } else {
@@ -583,7 +585,8 @@ export const zohoAdapter: Adapter = {
         }
       } catch (e) {
         failed = true;
-        const r: StepResult = { seq: step.seq, status: "failed", error: { code: "STEP_FAILED", message: String(e) } };
+        const d = describeThrown(e);
+        const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
         results.push(r); onStep(r);
       }
     }
@@ -609,7 +612,7 @@ export const zohoAdapter: Adapter = {
             continue;
           }
           const del = await zoho(conn, `/crm/v8/settings/fields/${target.id}?module=${encodeURIComponent(moduleApi)}`, { method: "DELETE" });
-          if (del.status >= 400) throw new Error(`zoho field delete ${del.status}: ${JSON.stringify(del.body)}`);
+          if (del.status >= 400) throw classifyZohoResponse({ status: del.status, body: del.body, retryAfterHeader: del.retryAfter });
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "create_field", deleted_id: target.id } };
           results.push(r); onStep(r);
         } else if (step.operation === "create_pipeline") {
@@ -627,7 +630,8 @@ export const zohoAdapter: Adapter = {
           results.push(r); onStep(r);
         }
       } catch (e) {
-        const r: StepResult = { seq: step.seq, status: "failed", error: { code: "TEARDOWN_FAILED", message: String(e) } };
+        const d = describeThrown(e);
+        const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
         results.push(r); onStep(r);
       }
     }
