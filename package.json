@@ -8,9 +8,12 @@
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "smoke": "bash scripts/smoke-p0.sh"
+    "dev": "tsx watch src/host/server.ts",
+    "smoke": "bash scripts/smoke-p0.sh",
+    "start": "node --experimental-strip-types src/host/server.ts",
+    "migrate": "psql \"$DATABASE_URL\" -f db/migrations/0001_initial.sql",
+    "db:up": "docker compose up -d db",
+    "db:down": "docker compose down"
   },
   "keywords": [],
   "author": "",
@@ -19,13 +22,16 @@
   "private": "true",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "agents": "^0.16.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "pg": "^8.21.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260613.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.9.3",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.22.4",
-    "typescript": "^6.0.3",
-    "wrangler": "^4.100.0"
+    "typescript": "^6.0.3"
   }
 }

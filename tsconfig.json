@@ -4,8 +4,7 @@
     "module": "ES2022",
     "moduleResolution": "Bundler",
     "lib": ["ES2022"],
-    "types": ["@cloudflare/workers-types"],
-    "jsx": "react",
+    "types": ["node"],
     "strict": true,
     "noUnusedLocals": false,
     "noUnusedParameters": false,
@@ -18,5 +17,5 @@
     "resolveJsonModule": true,
     "verbatimModuleSyntax": false
   },
-  "include": ["src/**/*", "worker-configuration.d.ts"]
+  "include": ["src/**/*"]
 }

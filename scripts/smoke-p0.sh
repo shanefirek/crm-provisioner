@@ -141,7 +141,7 @@ ST=$(echo "$R" | field_of run.trace_id)
 [ "$RS" = "succeeded" ] && pass "run status persisted = succeeded" || fail "run status persisted" "got $RS"
 [ "$ST" = "$TRACE" ] && pass "trace_id persisted on run" || fail "trace_id persisted on run" "expected $TRACE got $ST"
 SC=$(echo "$R" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).steps||[]).length))")
-[ "$SC" -ge 5 ] && pass "run has >=5 step rows in D1" || fail "run has >=5 step rows in D1" "got $SC"
+[ "$SC" -ge 5 ] && pass "run has >=5 step rows in Postgres" || fail "run has >=5 step rows in Postgres" "got $SC"
 
 # ---- 11. idempotency: same delta + same connection → noop steps ----
 echo "== idempotency (second plan on same state) =="

@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: crm-provisioner-pg
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: crm
+      POSTGRES_DB: crm_provisioner
+    ports:
+      - "5433:5432"   # 5433 host → 5432 container, avoid collision with any other local pg
+    volumes:
+      - crm_provisioner_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crm -d crm_provisioner"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  crm_provisioner_pg:

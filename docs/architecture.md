@@ -8,14 +8,14 @@ Turn a plain-English CRM setup request into a configured Zoho or Salesforce inst
 
 ```
 Claude (MCP client)
-  │ connect_crm ──────────────► OAuth callback (Worker route) ──► connections (D1, per-DC for Zoho)
+  │ connect_crm ──────────────► OAuth callback (Express route) ──► connections (Postgres, per-DC for Zoho)
   │ list_templates ───────────► template library (versioned specs + extension-point rules)
   │ inspect_instance ─────────► adapter.read(connection) ──► current-state snapshot
   │ [authors delta]
   │ validate_spec ────────────► schema + extension-rule lint (instructive errors)
   │ plan ─────────────────────► resolve(template+delta) vs instance ──► diff {create|update|conflict|UNSUPPORTED}
   │ [human confirms plan]
-  │ apply ────────────────────► driver: ordered steps, idempotency keys, run ledger (D1)
+  │ apply ────────────────────► driver: ordered steps, idempotency keys, run ledger (Postgres)
   │                                 ├── adapters/salesforce: spec → metadata package → sf deploy
   │                                 └── adapters/zoho: spec → REST sequence + Deluge pattern stamps
   └ get_run ──────────────────► step-by-step results, resumable
@@ -30,10 +30,10 @@ Claude (MCP client)
 | Adapter interface + capability map type | `adapters/types` | `spec/` types |
 | Salesforce adapter | `adapters/salesforce` | `adapters/types` |
 | Zoho adapter (+ Deluge pattern library) | `adapters/zoho` | `adapters/types` |
-| MCP server (7 tools), OAuth routes, D1 persistence | `mcp/` (the Workers host) | everything above |
+| MCP server (7 tools, `StreamableHTTPServerTransport`), OAuth routes, pg persistence | `src/host/` (Express + pg on Railway) | everything above |
 | Template library | `templates/` | spec schema (data, not code) |
 
-Dependency direction is strictly downward in this table. The core stays portable (Railway/Node port = host-layer swap only).
+Dependency direction is strictly downward in this table. The core stays portable — host swap (e.g., back to Workers, or to bare Node) is a `src/host/` rewrite only. **(History: P0 shipped first on Cloudflare Workers + Durable Objects + D1; pivoted same night to Express + Postgres on Railway after Stefan/HubSpot-provisioner-fluency reweighting — see `docs/decision-log.md` entry 10.)**
 
 ## Principle audit table
 
@@ -45,7 +45,7 @@ Dependency direction is strictly downward in this table. The core stays portable
 | configuration-philosophy (fail-closed) | Extension-point rules: a delta touching an undeclared point is rejected, not merged | Overlay resolver default-deny |
 | error-handling (categories + retry) | Boundary (CRM 5xx → retry/backoff) vs data (bad delta → instructive reject) vs config (bad template → fail at load); dead/permanent failures recorded on the run | Typed errors in `spec/driver`; retry only on BoundaryError |
 | error-handling (quality watchdog) | `apply` halts on first non-retryable step failure with resumable ledger — no half-configured org without a receipt | Run ledger per-step status; `get_run` exposes it |
-| multi-tenancy-isolation | Connections are tenant-scoped rows (org id + DC + token); no cross-connection reads; per-DC OAuth endpoints for Zoho | Connection id required on every tool call; D1 queries always filtered by connection |
+| multi-tenancy-isolation | Connections are tenant-scoped rows (org id + DC + token); no cross-connection reads; per-DC OAuth endpoints for Zoho | Connection id required on every tool call; Postgres queries always filtered by connection |
 | testing-philosophy (fixture/boundary) | Adapter tests born from api-ingest fixtures; smoke = MCP round-trip on stub adapter; SFDC gate runs against scratch org | `scripts/smoke-p0.sh` extended per phase; fixtures committed scrubbed |
 | cost-unit-economics | LLM spend is the caller's (Claude session); CRM API calls are free-tier; only watch SFDC scratch-org limits + Zoho trial expiry | Noted in capability maps; no paid rungs exist yet — re-audit if one appears |
 | modular-monorepo-shape | Table above; core/adapters/host split | Import-direction review prompt; core has zero CF imports (greppable) |
@@ -55,4 +55,4 @@ Dependency direction is strictly downward in this table. The core stays portable
 
 1. **Zoho workflow-rule creation may not be REST-exposed** → adapter verdict becomes `pattern library` (Deluge) or `manual`; plan must surface it as UNSUPPORTED, not fail.
 2. **Zoho instance creation is not API-able** (trial signup manual) → demo runbook includes the manual step explicitly.
-3. **SFDC metadata deploy latency** (seconds-minutes) → `apply` must be async with `get_run` polling from day 0 — shapes the driver interface before any adapter exists.
+3. **SFDC metadata deploy latency** (seconds-minutes) → `apply` must be async with `get_run` polling from day 0 — shapes the driver interface before any adapter exists. (Express + pg makes this easy; was a real concern under Workers' subrequest/CPU limits.)
