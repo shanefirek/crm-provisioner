@@ -102,10 +102,12 @@ export const ProvisionSpecSchema = z.object({
 export type ProvisionSpec = z.infer<typeof ProvisionSpecSchema>;
 
 // ---------- DeltaSpec (what the LLM actually writes) ----------
-// Same shape as ProvisionSpec minus `extends` (which is in the parent template ref)
+// Same shape as ProvisionSpec minus `extends` (which is in the parent template ref).
+// .strict() so unknown keys are REJECTED, not silently dropped — fail-closed schema,
+// same principle as the overlay resolver's default-deny on extension points.
 export const DeltaSpecSchema = ProvisionSpecSchema.omit({ extends: true, spec_version: true }).extend({
   spec_version: z.literal(0),
-});
+}).strict();
 export type DeltaSpec = z.infer<typeof DeltaSpecSchema>;
 
 // ---------- Template (data, not code) ----------

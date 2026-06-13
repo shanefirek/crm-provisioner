@@ -76,6 +76,14 @@ R=$(mcp_call 2 'tools/call' '{"name":"list_templates","arguments":{}}' | text_of
 TID=$(echo "$R" | field_of templates.0.id)
 [ "$TID" = "toy-sales" ] && pass "toy-sales template present" || fail "toy-sales template present" "got '$TID'"
 
+# P4: real templates registered
+TCOUNT=$(echo "$R" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).templates||[]).length))")
+[ "$TCOUNT" -ge 3 ] && pass "registry has >=3 templates (toy + 2 verticals)" || fail "registry has >=3 templates" "got $TCOUNT"
+echo "$R" | node -e "
+const t=JSON.parse(require('fs').readFileSync(0)).templates||[];
+process.exit(t.some(x=>x.id==='real-estate') && t.some(x=>x.id==='professional-services') ? 0 : 1);
+" && pass "real-estate@v1 + professional-services@v1 both registered" || fail "vertical templates registered" "missing"
+
 # ---- 3. connect_crm (demo, writable) ----
 echo "== connect_crm (demo, writable) =="
 R=$(mcp_call 3 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"smoke","is_demo":true,"api_domain":"memory://smoke","writable_org_ids":["memory://smoke"]}}' | text_of)
@@ -279,6 +287,40 @@ process.stdout.write(f ? 'still-there' : 'gone');
 else
   echo "  (SF_LIVE=0 — live SFDC assertions skipped. Run 'SF_LIVE=1 bash scripts/smoke-p0.sh' to exercise.)"
 fi
+
+# ---- P4: cold-session-style assertion ----
+# A "cold" Claude session would: list_templates → pick one → author a tiny
+# vertical-appropriate delta → validate → plan → see correct diff. Done with
+# real-estate@v1 against the memory adapter (no real CRM needed).
+echo "== P4: cold-session against real-estate@v1 (memory adapter) =="
+R=$(mcp_call 70 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"P4 cold session","is_demo":true,"api_domain":"memory://p4","writable_org_ids":["memory://p4"]}}' | text_of)
+P4_CONN=$(echo "$R" | field_of connection_id)
+# Plain-language scenario encoded as the simplest possible delta:
+# "Add an 'Inspection Scheduled' stage to the residential pipeline."
+P4_DELTA='{"spec_version":0,"fields":[],"stages":[{"api_name":"Inspection_Scheduled","label":"Inspection Scheduled","forecast_category":"Pipeline","forecast_type":"Open","probability":40}],"pipelines":[{"api_name":"Residential","label":"Residential","module":"Deal","stages":["Inquiry_Received","Showing_Scheduled","Inspection_Scheduled","Offer_Made","Under_Contract","Closed_Won"]}],"workflows":[]}'
+R=$(mcp_call 71 'tools/call' "{\"name\":\"validate_spec\",\"arguments\":{\"template_ref\":\"real-estate\",\"delta\":$P4_DELTA}}" | text_of)
+OK=$(echo "$R" | field_of ok)
+[ "$OK" = "true" ] && pass "P4: real-estate + delta validates" || fail "P4 validate" "$R"
+
+R=$(mcp_call 72 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P4_CONN\",\"template_ref\":\"real-estate\",\"delta\":$P4_DELTA}}" | text_of)
+P4_PLAN=$(echo "$R" | field_of plan_id)
+P4_STEPS=$(echo "$R" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).steps||[]).length))")
+# 5 base fields + 6 base stages (5 + 1 appended) + 1 pipeline (noop) + 0 workflows
+[ "$P4_STEPS" -ge 12 ] && pass "P4: plan has >=12 steps (5 fields + 6 stages + 1 pipeline)" || fail "P4 plan step count" "got $P4_STEPS"
+
+R=$(mcp_call 73 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P4_PLAN\"}}" | text_of)
+[ "$(echo "$R" | field_of status)" = "succeeded" ] && pass "P4: apply succeeded against memory adapter" || fail "P4 apply" "$R"
+
+# Validate professional-services too
+R=$(mcp_call 74 'tools/call' '{"name":"validate_spec","arguments":{"template_ref":"professional-services","delta":{"spec_version":0,"fields":[],"stages":[],"pipelines":[],"workflows":[]}}}' | text_of)
+[ "$(echo "$R" | field_of ok)" = "true" ] && pass "P4: professional-services base validates" || fail "P4 prof-svc validate" "$R"
+
+# Extension-point default-deny still works on the real templates
+BAD='{"spec_version":0,"fields":[{"module":"Lead","api_name":"x","label":"x","kind":"text"}],"stages":[],"pipelines":[],"workflows":[],"extends":"trying_to_overwrite"}'
+R=$(mcp_call 75 'tools/call' "{\"name\":\"validate_spec\",\"arguments\":{\"template_ref\":\"real-estate\",\"delta\":$BAD}}" | text_of)
+# delta has extra `extends` field which is not allowed (DeltaSpecSchema omits it)
+ERR=$(echo "$R" | field_of error)
+[ "$ERR" = "DELTA_SCHEMA_INVALID" ] && pass "P4: delta with disallowed 'extends' field rejected" || fail "P4 extra-field rejection" "got $ERR"
 
 # ============================================================================
 # LIVE ZOHO SMOKE — gated on ZOHO_LIVE=1
