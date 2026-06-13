@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Natural language → typed ProvisionSpec (template + delta) → deterministic driver → CRM adapter (Salesforce, Zoho). MCP server interface — Claude is the UI.",
   "main": "index.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "directories": {
     "doc": "docs"
   },

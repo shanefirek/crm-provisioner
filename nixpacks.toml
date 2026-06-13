@@ -1,0 +1,8 @@
+# Railway / Nixpacks build config.
+# - postgresql: client tools (psql) needed by scripts/migrate.sh at startup.
+# - The startCommand in railway.toml chains migrate then the server, both via Nix-provided
+#   tools. Removing this file would build successfully but fail at startup ("psql: command
+#   not found").
+
+[phases.setup]
+nixPkgs = ["postgresql", "nodejs_22"]
