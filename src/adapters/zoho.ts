@@ -12,7 +12,7 @@
 //   - assignment_rules: ❌ no v8 REST create surface — UNSUPPORTED.
 
 import type { ProvisionSpec, StageSpec, WorkflowShape } from "../core/spec.ts";
-import { BoundaryError, classifyZohoResponse, describeThrown, retryBoundary } from "../host/errors.ts";
+import { BoundaryError, classifyZohoResponse, ConfigError, describeThrown, retryBoundary } from "../host/errors.ts";
 import type {
   Adapter,
   ApplyResult,
@@ -79,7 +79,14 @@ async function zoho(
   path: string,
   init: { method?: "GET" | "POST" | "PATCH" | "DELETE"; body?: unknown } = {},
 ): Promise<{ status: number; body: unknown; retryAfter?: string | null }> {
-  const base = conn.api_domain || "https://www.zohoapis.com";
+  // P10 fix #5 (defense in depth): connect_crm rejects Zoho connections without api_domain,
+  // but the adapter checks too in case a connection row was created out-of-band.
+  if (!conn.api_domain) {
+    throw new ConfigError(
+      `zoho connection ${conn.id} has no api_domain. Re-create the connection with the api_domain returned by the OAuth token exchange.`,
+    );
+  }
+  const base = conn.api_domain;
   const url = `${base}${path}`;
   let token = await mintAccessToken(conn);
   let res = await doFetch();

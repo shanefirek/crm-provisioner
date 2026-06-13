@@ -147,6 +147,14 @@ export type RetryOpts = {
   capMs?: number;             // default 10s — cap for backoff
   /** Honor Retry-After header from rate_limit errors. Default true. */
   honorRetryAfter?: boolean;
+  /**
+   * Cap (ms) on vendor-provided Retry-After. Default 5 minutes (300_000).
+   * Distinct from `capMs` (the backoff cap) — when a vendor SAYS retry in 60s, we
+   * trust them; the previous shared 10s cap silently burned attempts on a 429 with
+   * Retry-After: 60 by retrying after 10s. Set lower only if you have evidence the
+   * vendor lies about Retry-After values.
+   */
+  retryAfterCapMs?: number;
 };
 
 /**
@@ -163,6 +171,7 @@ export async function retryBoundary<T>(fn: () => Promise<T>, opts: RetryOpts = {
   const maxAttempts = opts.maxAttempts ?? 5;
   const baseMs = opts.baseMs ?? 250;
   const capMs = opts.capMs ?? 10_000;
+  const retryAfterCapMs = opts.retryAfterCapMs ?? 300_000;
   const honorRetryAfter = opts.honorRetryAfter ?? true;
 
   let attempt = 0;
@@ -183,7 +192,7 @@ export async function retryBoundary<T>(fn: () => Promise<T>, opts: RetryOpts = {
         e.attempts = attempt;
         throw e;
       }
-      const delayMs = computeDelay(attempt, baseMs, capMs, honorRetryAfter ? e.retryAfterSec : undefined);
+      const delayMs = computeDelay(attempt, baseMs, capMs, retryAfterCapMs, honorRetryAfter ? e.retryAfterSec : undefined);
       await sleep(delayMs);
     }
   }
@@ -191,9 +200,17 @@ export async function retryBoundary<T>(fn: () => Promise<T>, opts: RetryOpts = {
   throw lastErr;
 }
 
-function computeDelay(attempt: number, baseMs: number, capMs: number, retryAfterSec?: number): number {
+/**
+ * Compute the next backoff delay.
+ * - Vendor-provided Retry-After (rate_limit): honored up to `retryAfterCapMs` (default 5min).
+ *   Previously shared `capMs` — a 60s Retry-After got clamped to 10s, burning an attempt.
+ * - Otherwise: exponential ±25% jitter, capped at `capMs`.
+ *
+ * Exported for boundary testing.
+ */
+export function computeDelay(attempt: number, baseMs: number, capMs: number, retryAfterCapMs: number, retryAfterSec?: number): number {
   if (retryAfterSec !== undefined && retryAfterSec > 0) {
-    return Math.min(retryAfterSec * 1000, capMs);
+    return Math.min(retryAfterSec * 1000, retryAfterCapMs);
   }
   // Exponential with jitter: base * 2^(attempt-1), jittered ±25%, capped.
   const exp = baseMs * Math.pow(2, attempt - 1);

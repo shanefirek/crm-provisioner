@@ -14,7 +14,10 @@
 //   - teardown_run clears cache entries for each reversed step (the field /
 //     pipeline / etc. is gone, so a future create attempt has a clean slate).
 
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
+
+/** Either a pg pool or a checked-out client; both expose .query() identically. */
+type Queryable = Pool | PoolClient;
 import { stableHash } from "../core/overlay.ts";
 import type { Plan, PlanStep } from "../adapters/types.ts";
 
@@ -117,7 +120,7 @@ export function unblockSteps(plan: Plan): number {
  * a repeat failure refreshes `last_seen_at` + `expires_at` without duplicating.
  */
 export async function recordPermanentFailure(
-  db: Pool,
+  db: Queryable,
   args: {
     connectionId: string;
     operation: string;
@@ -149,7 +152,7 @@ export async function recordPermanentFailure(
  * with) is now gone" — so the cached failure is no longer applicable.
  */
 export async function clearForReversed(
-  db: Pool,
+  db: Queryable,
   args: { connectionId: string; operation: string; payload: unknown },
 ): Promise<void> {
   const payloadHash = hashStepPayload(args.payload);

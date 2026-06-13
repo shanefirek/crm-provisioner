@@ -119,6 +119,20 @@ export function buildMcpServer(): McpServer {
       },
     },
     async ({ crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token, dc }) => {
+      // P10 fix #5: Zoho api_domain is per-DC tenant config (tier-2). The token-exchange
+      // response returns it; without it the adapter silently falls back to zohoapis.com
+      // and every API call for an EU/IN/AU customer 404s. Fail-at-boot, not fall-back —
+      // configuration-philosophy tier-2 rule.
+      if (crm === "zoho" && !api_domain) {
+        return ok(
+          JSON.stringify({
+            ok: false,
+            error: "CONFIG_ERROR",
+            message:
+              "zoho connection requires api_domain (the per-DC base URL, e.g. https://www.zohoapis.eu). Without it every API call silently routes to .com. Re-call connect_crm with api_domain from the OAuth exchange response.",
+          }),
+        );
+      }
       const id = crypto.randomUUID();
       await db.query(
         `insert into connections (id, crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token, dc)
@@ -257,11 +271,21 @@ export function buildMcpServer(): McpServer {
         );
       }
 
+      // P10 fix #1: shallow-clone the cached plan (and its step array) BEFORE any mutation
+      // or dispatch. Two concurrent applies on the same plan_id would otherwise alias
+      // `cached.plan.steps` — the first apply's `unblockSteps` mutation would be visible
+      // to the second, and the adapter callback's `steps[step.seq - 1]` reads would race.
+      // Honors multi-tenancy-isolation: in-flight apply state is per-call, not shared.
+      const plan: Plan = {
+        ...cached.plan,
+        steps: cached.plan.steps.map((s) => ({ ...s })),
+      };
+
       // P6: force_retry_blocked rewrites blocked steps back to "create" before
       // we hand the plan to the adapter. Without it, blocked steps stay blocked
       // and the adapter skips them with status="skipped_blocked".
       let unblocked = 0;
-      if (force_retry_blocked) unblocked = unblockSteps(cached.plan);
+      if (force_retry_blocked) unblocked = unblockSteps(plan);
 
       const run_id = `run_${crypto.randomUUID()}`;
       const trace_id = trace();
@@ -273,11 +297,15 @@ export function buildMcpServer(): McpServer {
         await client.query(
           `insert into runs (id, connection_id, spec_hash, template_id, template_version, status, plan_json, trace_id)
              values ($1, $2, $3, $4, $5, 'running', $6::jsonb, $7)`,
-          [run_id, conn.id, cached.plan.spec_hash, tplId || null, tplVer || null, JSON.stringify(cached.plan), trace_id],
+          [run_id, conn.id, plan.spec_hash, tplId || null, tplVer || null, JSON.stringify(plan), trace_id],
         );
 
-        const stepWrites: Array<Promise<unknown>> = [];
-        // P6: collect permanent-failure inserts to flush after the run row commits.
+        // P10 fix #3: PoolClient is NOT safe for concurrent query dispatch in node-postgres.
+        // Buffer step writes here (just the row data) and flush them sequentially AFTER the
+        // adapter returns. The callback is sync — pushing to an array is safe; the queries
+        // are serialized on the single open client below.
+        const pendingStepRows: Array<unknown[]> = [];
+        // P6: collect permanent-failure inserts to flush after the step rows.
         const cacheWrites: Array<{ operation: string; payload: unknown; errorCode: string; errorMessage: string }> = [];
         // P7: watchdog tracks failure-rate and silent-success-rate over a trailing window.
         const watchdog = new WatchdogTracker();
@@ -285,9 +313,9 @@ export function buildMcpServer(): McpServer {
         const adapter = adapterFor(conn.crm);
         const result = await adapter.apply(
           conn,
-          cached.plan,
+          plan,
           (step) => {
-          const planStep = cached.plan.steps[step.seq - 1];
+          const planStep = plan.steps[step.seq - 1];
           // Record permanent-failure for cacheable error codes.
           if (step.status === "failed" && isCacheableFailure(step.error?.code) && planStep) {
             cacheWrites.push({
@@ -300,40 +328,44 @@ export function buildMcpServer(): McpServer {
           // P7: feed each step result to the watchdog tracker. Don't double-count
           // watchdog-already-skipped steps (those came from the abort cascade).
           if (step.status !== "skipped_by_watchdog") {
-            const verdict = watchdog.observe(cached.plan, step);
+            const verdict = watchdog.observe(plan, step);
             if (verdict.tripped && !watchdog_trip_reason) {
               watchdog_trip_reason = `WatchdogError:${verdict.kind} — ${verdict.message}`;
             }
           }
-          stepWrites.push(
-            client.query(
-              `insert into run_steps (run_id, seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, attempts, started_at, finished_at)
-                 values ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, $10, $11, extract(epoch from now())::integer, extract(epoch from now())::integer)`,
-              [
-                run_id,
-                step.seq,
-                planStep?.operation ?? "unknown",
-                planStep?.target ?? null,
-                JSON.stringify(planStep?.payload ?? null),
-                step.status,
-                step.result ? JSON.stringify(step.result) : null,
-                step.error?.code ?? null,
-                step.error?.message ?? null,
-                planStep?.destructive ?? false,
-                step.error?.attempts ?? 1,
-              ],
-            ),
-          );
+          pendingStepRows.push([
+            run_id,
+            step.seq,
+            planStep?.operation ?? "unknown",
+            planStep?.target ?? null,
+            JSON.stringify(planStep?.payload ?? null),
+            step.status,
+            step.result ? JSON.stringify(step.result) : null,
+            step.error?.code ?? null,
+            step.error?.message ?? null,
+            planStep?.destructive ?? false,
+            step.error?.attempts ?? 1,
+          ]);
         },
         // P7: shouldAbort — adapter calls this between steps; truthy result aborts.
         () => (watchdog_trip_reason ? { reason: watchdog_trip_reason } : null),
         );
-        await Promise.all(stepWrites);
 
-        // P6: persist permanent-failure cache rows AFTER step rows so a single rollback
-        // affects neither. Done within the same tx for atomicity.
+        // P10 fix #3 (cont): flush step rows sequentially on the open transaction client.
+        for (const params of pendingStepRows) {
+          await client.query(
+            `insert into run_steps (run_id, seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, attempts, started_at, finished_at)
+               values ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, $10, $11, extract(epoch from now())::integer, extract(epoch from now())::integer)`,
+            params,
+          );
+        }
+
+        // P10 fix #2: cache writes go through `client` (the open transaction), not the
+        // module-level pool. Previous code passed `db` here so a rollback on the run
+        // row would NOT roll back the cache rows — phantom blocks on a run that never
+        // officially failed. Now both rows share the same atomic boundary.
         for (const cw of cacheWrites) {
-          await recordPermanentFailure(db, {
+          await recordPermanentFailure(client, {
             connectionId: conn.id,
             operation: cw.operation,
             payload: cw.payload,
