@@ -47,7 +47,9 @@ A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (
 - `ZOHO_LIVE=1`: **105/105** (adds Zoho end-to-end + 4 template viability checks + workflow_rule teardown DELETE)
 - `SF_LIVE=1 ZOHO_LIVE=1`: **119/119**
 
-**CI gate (P13):** `.github/workflows/smoke.yml` runs default smoke on every push + PR to `main` (Postgres 16 service, Node 22, ~60-90s cold). Cloud-side verification lands the first time the repo is pushed to GitHub.
+**CI gate (P13):** `.github/workflows/smoke.yml` runs default smoke on every push + PR to `main` (Postgres 16 service, Node 22, ~40s cold). First green run observed 2026-06-13.
+
+**Production deploy:** `https://crm-provisioner-production.up.railway.app` (Railway, CLI-deploys via `railway up`). Postgres service provisions `DATABASE_URL` via reference variable; migrations run on every container start via `bash scripts/migrate.sh && node …` chain in `railway.toml`'s startCommand. Env vars (`TOKEN_AT_REST_KEY`, `ZOHO_*`) set on the Railway service — see `railway variables --service crm-provisioner`. The production `TOKEN_AT_REST_KEY` is DIFFERENT from `.dev.vars` (per environment per configuration-philosophy tier-1). GH-auto-deploy not yet wired — requires installing the Railway GitHub App on the private repo first (browser-auth step, not CLI). Until then, every deploy is `railway up` from local.
 
 **P14 prerequisite for new dev environments:** `TOKEN_AT_REST_KEY` must be set in `.dev.vars` (32-byte base64 random) — the server refuses to start without it. Already set in this repo's .dev.vars (gitignored).
 
