@@ -23,16 +23,24 @@ import type {
   StepResult,
 } from "./types.ts";
 
+// Capability map upgraded 2026-06-13 after web-harvest research. Workflow rules ARE
+// REST-creatable in v8 at /settings/automation/workflow_rules — S0 probed the wrong
+// path (/settings/workflow_rules vs /settings/automation/workflow_rules). Full body
+// shapes documented in docs/surfaces/zoho-deluge-patterns.md.
 const CAPS: CapabilityMap = {
   fields: "supported",
   stages: "supported",
   pipelines: "supported",
   workflows: {
-    idle_deal_alert: "unsupported",        // Deluge functions body shape pending (S0 ⚠️)
-    field_derivation: "unsupported",
-    round_robin_assignment: "unsupported",
+    idle_deal_alert: "supported",          // workflow_rule + scheduled_actions[automation_tasks]
+    field_derivation: "supported",         // workflow_rule + instant_actions[field_updates]
+    round_robin_assignment: "manual",      // requires a Deluge function; functions are UI-only.
+                                            // Canonical script in zoho-deluge-patterns.md;
+                                            // adapter records "manual" so plan output instructs
+                                            // the user to paste the function once in UI.
   },
-  assignment_rules: "unsupported",          // No v8 REST create surface (S0 ❌)
+  assignment_rules: "unsupported",          // Still no v8 REST surface for Lead AssignmentRules
+                                            // specifically (different from workflow rules).
   org_create: "manual",
 };
 
@@ -145,6 +153,9 @@ type FieldPayload = { api_name: string; label: string; kind: string; module: str
 function isWorkflowSupported(shape: string): boolean {
   return CAPS.workflows[shape] === "supported";
 }
+function isWorkflowManual(shape: string): boolean {
+  return CAPS.workflows[shape] === "manual";
+}
 
 async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snapshot): Promise<Plan> {
   const steps: PlanStep[] = [];
@@ -190,6 +201,10 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
 
   for (const w of spec.workflows) {
     const supported = isWorkflowSupported(w.shape);
+    const manual = isWorkflowManual(w.shape);
+    let notes: string | undefined;
+    if (manual) notes = `Zoho: ${w.shape} requires a Deluge function (functions are UI-only). See docs/surfaces/zoho-deluge-patterns.md for the canonical script — paste once in Setup > Developer Hub > Functions, then re-run plan with the function ID referenced.`;
+    else if (!supported) notes = `Zoho v8: ${w.shape} unsupported by adapter.`;
     steps.push({
       seq: seq++,
       operation: `create_workflow:${w.shape}`,
@@ -197,7 +212,7 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
       payload: w as WorkflowShape,
       diff: supported ? "create" : "unsupported",
       destructive: false,
-      notes: supported ? undefined : `Zoho v8: ${w.shape} not creatable via public REST (Deluge functions body shape pending). Surface manual instruction OR wait for Varun's idiom.`,
+      notes,
     });
   }
 
@@ -304,6 +319,168 @@ async function addStages(conn: ConnectionContext, additions: StageSpec[], snap: 
   return respBody;
 }
 
+// --- Workflow shapes -------------------------------------------------------
+// All built on Zoho's automation_action + workflow_rule pattern documented in
+// docs/surfaces/zoho-deluge-patterns.md. Each shape compiles to (1) one action
+// of the appropriate type, then (2) a workflow_rule that references the action.
+
+async function createAutomationTask(conn: ConnectionContext, name: string, subject: string, dueDaysAfterTrigger: number): Promise<string> {
+  // Endpoint: /settings/automation/tasks (NOT /automation_tasks — wrapper key matches).
+  // Body uses field_mappings; Due_Date requires type:'execution_time' with relative
+  // period/unit/sign/trigger_field (per v8 docs — Date fields can ONLY be execution_time).
+  const body = {
+    tasks: [{
+      name,
+      module: { api_name: "Deals" },
+      feature_type: "workflow",
+      field_mappings: [
+        { field: { api_name: "Subject" }, type: "static", value: subject },
+        { field: { api_name: "Status" },  type: "static", value: "Not Started" },
+        {
+          field: { api_name: "Due_Date" },
+          type: "execution_time",
+          value: {
+            period: "days",
+            unit: String(dueDaysAfterTrigger),
+            trigger_field: "${!Deals.Created_Time}",
+            sign: "plus",
+          },
+        },
+      ],
+    }],
+  };
+  const { status, body: respBody } = await zoho(conn, "/crm/v8/settings/automation/tasks", { method: "POST", body });
+  if (status >= 400) throw new Error(`zoho automation_task create ${status}: ${JSON.stringify(respBody)}`);
+  const id = (respBody as { tasks?: Array<{ details?: { id?: string } }> })?.tasks?.[0]?.details?.id;
+  if (!id) throw new Error(`zoho automation_task create: no id in response: ${JSON.stringify(respBody)}`);
+  return id;
+}
+
+async function createFieldUpdate(conn: ConnectionContext, name: string, module: string, targetField: string, sourceField: string): Promise<string> {
+  // field_updates supports setting a field to a literal OR another field's value.
+  // We use "field" type for the latter (the field_derivation shape).
+  const body = {
+    field_updates: [{
+      name,
+      module: { api_name: module },
+      feature_type: "workflow",
+      field: { api_name: targetField },
+      value: { type: "field", details: { api_name: sourceField } },
+    }],
+  };
+  const { status, body: respBody } = await zoho(conn, "/crm/v8/settings/automation/field_updates", { method: "POST", body });
+  if (status >= 400) throw new Error(`zoho field_update create ${status}: ${JSON.stringify(respBody)}`);
+  const id = (respBody as { field_updates?: Array<{ details?: { id?: string } }> })?.field_updates?.[0]?.details?.id;
+  if (!id) throw new Error(`zoho field_update create: no id in response: ${JSON.stringify(respBody)}`);
+  return id;
+}
+
+// Zoho v8 action types as referenced inside a workflow_rule's actions[].type field.
+// NB: action TYPE strings differ from the endpoint paths:
+//   endpoint /settings/automation/tasks            → actions[].type = "tasks"
+//   endpoint /settings/automation/field_updates    → actions[].type = "field_updates"
+//   endpoint /settings/automation/email_notifications → actions[].type = "email_notifications"
+//   endpoint /settings/automation/webhooks         → actions[].type = "webhooks"
+type ActionType = "tasks" | "field_updates" | "email_notifications" | "webhooks";
+
+type WorkflowRuleSpec = {
+  name: string;
+  module: string;
+  trigger_type: "create" | "edit" | "create_or_edit";
+  repeat: boolean;
+  criteria?: { field: string; comparator: string; value: string };
+  instantActionIds?: Array<{ id: string; type: ActionType }>;
+  scheduledAction?: {
+    period: "days" | "hours" | "minutes";
+    unit: number;
+    actionId: string;
+    actionType: ActionType;
+  };
+};
+
+async function createWorkflowRule(conn: ConnectionContext, spec: WorkflowRuleSpec): Promise<string> {
+  const condition: Record<string, unknown> = {
+    sequence_number: 1,
+  };
+  if (spec.criteria) {
+    condition.criteria_details = {
+      criteria: {
+        group_operator: "AND",
+        group: [{
+          comparator: spec.criteria.comparator,
+          field: { api_name: spec.criteria.field },
+          type: "value",
+          value: spec.criteria.value,
+        }],
+      },
+    };
+  }
+  if (spec.instantActionIds?.length) {
+    condition.instant_actions = { actions: spec.instantActionIds };
+  }
+  if (spec.scheduledAction) {
+    condition.scheduled_actions = [{
+      execute_after: { period: spec.scheduledAction.period, unit: spec.scheduledAction.unit },
+      actions: [{ id: spec.scheduledAction.actionId, type: spec.scheduledAction.actionType }],
+    }];
+  }
+  const body = {
+    workflow_rules: [{
+      execute_when: {
+        type: spec.trigger_type,
+        details: {
+          trigger_module: { api_name: spec.module },
+          ...(spec.trigger_type !== "create" && { repeat: spec.repeat }),
+        },
+      },
+      module: { api_name: spec.module },
+      name: spec.name,
+      description: `Provisioned by crm-provisioner — ${spec.name}`,
+      lock: { status: false },
+      conditions: [condition],
+    }],
+  };
+  const { status, body: respBody } = await zoho(conn, "/crm/v8/settings/automation/workflow_rules", { method: "POST", body });
+  if (status >= 400) throw new Error(`zoho workflow_rule create ${status}: ${JSON.stringify(respBody)}`);
+  const id = (respBody as { workflow_rules?: Array<{ details?: { id?: string } }> })?.workflow_rules?.[0]?.details?.id;
+  if (!id) throw new Error(`zoho workflow_rule create: no id in response: ${JSON.stringify(respBody)}`);
+  return id;
+}
+
+async function createIdleDealAlertWorkflow(conn: ConnectionContext, w: Extract<WorkflowShape, { shape: "idle_deal_alert" }>): Promise<unknown> {
+  // 1. Create the automation_task action ("follow up on idle deal")
+  const taskName = `prov_${w.api_name}_task`;
+  const subject = `Follow up: deal idle ${w.idle_days} days in ${w.stage}`;
+  const taskActionId = await createAutomationTask(conn, taskName, subject, w.idle_days);
+
+  // 2. Create the workflow rule that fires the task after N days when stage matches
+  // NB: scheduled_actions are disallowed when repeat=true on edit triggers.
+  // We use repeat=false so the rule fires once per record-stage-entry.
+  const ruleId = await createWorkflowRule(conn, {
+    name: `prov_${w.api_name}`,
+    module: "Deals",
+    trigger_type: "edit",
+    repeat: false,
+    criteria: { field: "Stage", comparator: "equal", value: w.stage },
+    scheduledAction: { period: "days", unit: w.idle_days, actionId: taskActionId, actionType: "tasks" },
+  });
+  return { workflow_rule_id: ruleId, task_action_id: taskActionId };
+}
+
+async function createFieldDerivationWorkflow(conn: ConnectionContext, w: Extract<WorkflowShape, { shape: "field_derivation" }>): Promise<unknown> {
+  const fuName = `prov_${w.api_name}_fu`;
+  const fuId = await createFieldUpdate(conn, fuName, w.module === "Lead" ? "Leads" : w.module, w.target_field, w.source_field);
+  const triggerType: WorkflowRuleSpec["trigger_type"] = w.when === "on_create" ? "create" : w.when === "on_update" ? "edit" : "create_or_edit";
+  const ruleId = await createWorkflowRule(conn, {
+    name: `prov_${w.api_name}`,
+    module: w.module === "Lead" ? "Leads" : w.module,
+    trigger_type: triggerType,
+    repeat: true,
+    instantActionIds: [{ id: fuId, type: "field_updates" }],
+  });
+  return { workflow_rule_id: ruleId, field_update_id: fuId };
+}
+
 async function createPipeline(conn: ConnectionContext, p: { api_name: string; label: string; stages: string[] }, snap: Snapshot): Promise<unknown> {
   if (!snap.default_deals_layout_id) throw new Error("zoho pipeline: no default Deals layout in snapshot");
   // Re-resolve stage IDs after any add_stage step (snapshot may be stale if stages were just added)
@@ -390,6 +567,14 @@ export const zohoAdapter: Adapter = {
           results.push(r); onStep(r);
         } else if (step.operation === "create_pipeline") {
           const res = await createPipeline(conn, step.payload as { api_name: string; label: string; stages: string[] }, snap);
+          const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
+          results.push(r); onStep(r);
+        } else if (step.operation === "create_workflow:idle_deal_alert") {
+          const res = await createIdleDealAlertWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "idle_deal_alert" }>);
+          const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
+          results.push(r); onStep(r);
+        } else if (step.operation === "create_workflow:field_derivation") {
+          const res = await createFieldDerivationWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "field_derivation" }>);
           const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
           results.push(r); onStep(r);
         } else {

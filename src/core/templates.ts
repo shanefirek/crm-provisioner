@@ -101,10 +101,79 @@ const PROFESSIONAL_SERVICES_V1: Template = {
   },
 };
 
+// ---- hvac-services@v1 ----
+// Field service / trades shape (HVAC, plumbing, electrical). The Zoho-buyer-fit
+// vertical called out on the 6/12 venture call. Authored from "set up Zoho for
+// a field service contractor" canon — partner customizes per business.
+const HVAC_SERVICES_V1: Template = {
+  id: "hvac-services",
+  version: "v1",
+  description: "Field service / trades — HVAC, plumbing, electrical contractor. Inquiry → estimate → job scheduled → completed → invoiced. Equipment + property + service-contract tracking. Five Lead fields, five deal stages, one pipeline.",
+  extension_points: COMMON_EXTENSION_POINTS,
+  base: {
+    spec_version: 0,
+    description: "Standard field-service contractor template (v1)",
+    fields: [
+      { module: "Lead", api_name: "service_type",       label: "Service Type",       kind: "text",   length: 80,  description: "'install' | 'repair' | 'maintenance' | 'inspection' | 'replacement'" },
+      { module: "Lead", api_name: "equipment_brand",    label: "Equipment Brand",    kind: "text",   length: 80,  description: "Brand of the equipment involved (Carrier, Trane, Lennox, etc.)" },
+      { module: "Lead", api_name: "property_address",   label: "Property Address",   kind: "text",   length: 255, description: "Service address (may differ from billing)" },
+      { module: "Lead", api_name: "urgency",            label: "Urgency",            kind: "text",   length: 16,  description: "'emergency' | 'same-day' | 'this-week' | 'scheduled'" },
+      { module: "Lead", api_name: "estimated_value",    label: "Estimated Value",    kind: "number", description: "Quick ballpark $; refined into Deal Amount when proposal sent" },
+    ],
+    stages: [
+      { api_name: "Inquiry_Received",   label: "Inquiry Received",   forecast_category: "Pipeline",     forecast_type: "Open",       probability: 10 },
+      { api_name: "Estimate_Sent",      label: "Estimate Sent",      forecast_category: "Best Case",    forecast_type: "Open",       probability: 40 },
+      { api_name: "Job_Scheduled",      label: "Job Scheduled",      forecast_category: "Commit",       forecast_type: "Open",       probability: 75 },
+      { api_name: "Completed",          label: "Completed",          forecast_category: "Closed (Won)", forecast_type: "Closed Won", probability: 95 },
+      { api_name: "Invoiced_Paid",      label: "Invoiced & Paid",    forecast_category: "Closed (Won)", forecast_type: "Closed Won", probability: 100 },
+    ],
+    pipelines: [
+      { api_name: "Service_Jobs", label: "Service Jobs", module: "Deal",
+        stages: ["Inquiry_Received", "Estimate_Sent", "Job_Scheduled", "Completed", "Invoiced_Paid"] },
+    ],
+    workflows: [],
+  },
+};
+
+// ---- manufacturing@v1 ----
+// B2B manufacturing/wholesale shape. Long sales cycles, multi-stakeholder, often
+// includes spec/sample/approval steps before contract.
+const MANUFACTURING_V1: Template = {
+  id: "manufacturing",
+  version: "v1",
+  description: "B2B manufacturing / wholesale — RFQ → spec review → sample sent → contract → PO received. Material + volume + lead-time tracking. Four Lead fields, six deal stages, one pipeline.",
+  extension_points: COMMON_EXTENSION_POINTS,
+  base: {
+    spec_version: 0,
+    description: "Standard B2B manufacturing template (v1)",
+    fields: [
+      { module: "Lead", api_name: "product_category", label: "Product Category", kind: "text",    length: 80, description: "Product family the inquiry maps to" },
+      { module: "Lead", api_name: "expected_volume",  label: "Expected Volume",  kind: "number",  description: "Units expected on the first PO" },
+      { module: "Lead", api_name: "required_by_date", label: "Required By Date", kind: "date",    description: "Customer-stated needed-by date" },
+      { module: "Lead", api_name: "spec_attached",    label: "Spec Attached",    kind: "boolean", description: "Whether the customer attached a spec sheet to the inquiry" },
+    ],
+    stages: [
+      { api_name: "RFQ_Received",     label: "RFQ Received",      forecast_category: "Pipeline",     forecast_type: "Open",       probability: 10 },
+      { api_name: "Spec_Review",      label: "Spec Review",       forecast_category: "Pipeline",     forecast_type: "Open",       probability: 25 },
+      { api_name: "Sample_Sent",      label: "Sample Sent",       forecast_category: "Best Case",    forecast_type: "Open",       probability: 50 },
+      { api_name: "Sample_Approved",  label: "Sample Approved",   forecast_category: "Commit",       forecast_type: "Open",       probability: 70 },
+      { api_name: "Contract_Sent",    label: "Contract Sent",     forecast_category: "Commit",       forecast_type: "Open",       probability: 85 },
+      { api_name: "PO_Received",      label: "PO Received",       forecast_category: "Closed (Won)", forecast_type: "Closed Won", probability: 100 },
+    ],
+    pipelines: [
+      { api_name: "Wholesale", label: "Wholesale", module: "Deal",
+        stages: ["RFQ_Received", "Spec_Review", "Sample_Sent", "Sample_Approved", "Contract_Sent", "PO_Received"] },
+    ],
+    workflows: [],
+  },
+};
+
 const REGISTRY: Record<string, Template> = {
   [`${TOY_SALES.id}@${TOY_SALES.version}`]: TOY_SALES,
   [`${REAL_ESTATE_V1.id}@${REAL_ESTATE_V1.version}`]: REAL_ESTATE_V1,
   [`${PROFESSIONAL_SERVICES_V1.id}@${PROFESSIONAL_SERVICES_V1.version}`]: PROFESSIONAL_SERVICES_V1,
+  [`${HVAC_SERVICES_V1.id}@${HVAC_SERVICES_V1.version}`]: HVAC_SERVICES_V1,
+  [`${MANUFACTURING_V1.id}@${MANUFACTURING_V1.version}`]: MANUFACTURING_V1,
 };
 
 export function listTemplates(): Array<{ id: string; version: string; description: string }> {

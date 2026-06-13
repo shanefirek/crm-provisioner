@@ -76,13 +76,14 @@ R=$(mcp_call 2 'tools/call' '{"name":"list_templates","arguments":{}}' | text_of
 TID=$(echo "$R" | field_of templates.0.id)
 [ "$TID" = "toy-sales" ] && pass "toy-sales template present" || fail "toy-sales template present" "got '$TID'"
 
-# P4: real templates registered
+# P4+: real templates registered (toy + 4 verticals after Zoho/Deluge harvest)
 TCOUNT=$(echo "$R" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).templates||[]).length))")
-[ "$TCOUNT" -ge 3 ] && pass "registry has >=3 templates (toy + 2 verticals)" || fail "registry has >=3 templates" "got $TCOUNT"
+[ "$TCOUNT" -ge 5 ] && pass "registry has >=5 templates (toy + 4 verticals)" || fail "registry has >=5 templates" "got $TCOUNT"
 echo "$R" | node -e "
 const t=JSON.parse(require('fs').readFileSync(0)).templates||[];
-process.exit(t.some(x=>x.id==='real-estate') && t.some(x=>x.id==='professional-services') ? 0 : 1);
-" && pass "real-estate@v1 + professional-services@v1 both registered" || fail "vertical templates registered" "missing"
+const required=['real-estate','professional-services','hvac-services','manufacturing'];
+process.exit(required.every(id=>t.some(x=>x.id===id)) ? 0 : 1);
+" && pass "all 4 vertical templates registered" || fail "vertical templates registered" "missing"
 
 # ---- 3. connect_crm (demo, writable) ----
 echo "== connect_crm (demo, writable) =="
@@ -399,11 +400,41 @@ process.stdout.write((d.snapshot?.fields_lead||[]).find(x=>x.api_name==='prov_zo
 ")
   [ "$GONE" = "gone" ] && pass "live Zoho: probe field removed by teardown" || fail "Zoho field removed" "got $GONE"
 
-  # Workflow shapes must surface as UNSUPPORTED (per the v0 capability map)
-  WF_DELTA='{"spec_version":0,"fields":[],"stages":[],"pipelines":[],"workflows":[{"shape":"idle_deal_alert","api_name":"prov_idle_alert","pipeline":"Standard","stage":"Qualified","idle_days":14,"notify":"owner"}]}'
+  # Workflow shapes (post-harvest): idle_deal_alert + field_derivation are SUPPORTED,
+  # round_robin_assignment stays MANUAL. Plan should show idle_deal_alert as 'create',
+  # not 'unsupported', and apply should create the workflow rule in the live trial.
+  WF_DELTA='{"spec_version":0,"fields":[],"stages":[],"pipelines":[],"workflows":[{"shape":"idle_deal_alert","api_name":"prov_idle_alert","pipeline":"Standard","stage":"Qualification","idle_days":14,"notify":"owner"}]}'
   R=$(mcp_call 68 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$WF_DELTA}}" | text_of)
-  UNSUP=$(echo "$R" | field_of unsupported_count)
-  [ "$UNSUP" = "1" ] && pass "live Zoho: workflow shape correctly marked UNSUPPORTED" || fail "Zoho unsupported surfacing" "unsupported_count=$UNSUP"
+  WF_STEP_DIFF=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_workflow:idle_deal_alert');
+process.stdout.write(s?.diff || 'missing');
+")
+  [ "$WF_STEP_DIFF" = "create" ] && pass "live Zoho: idle_deal_alert workflow now marked CREATE (post-harvest)" || fail "Zoho idle_deal_alert diff" "got '$WF_STEP_DIFF'"
+
+  WF_PLAN=$(echo "$R" | field_of plan_id)
+  R=$(mcp_call 69 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$WF_PLAN\"}}" | text_of)
+  WF_STATUS=$(echo "$R" | field_of status)
+  WF_RUN=$(echo "$R" | field_of run_id)
+  [ "$WF_STATUS" = "succeeded" ] && pass "live Zoho: workflow rule created end-to-end" || fail "Zoho workflow apply" "$R"
+
+  # Confirm the rule actually exists in Zoho by listing automation/workflow_rules
+  AT=$(curl -sS -X POST "$ZOHO_OAUTH_BASE/oauth/v2/token" -d "grant_type=refresh_token&client_id=$ZOHO_CLIENT_ID&client_secret=$ZOHO_CLIENT_SECRET&refresh_token=$ZOHO_REFRESH_TOKEN" 2>/dev/null | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0)).access_token||'')")
+  WF_EXISTS=$(curl -sS "$ZOHO_API_BASE/crm/v8/settings/automation/workflow_rules?module=Deals" -H "Authorization: Zoho-oauthtoken $AT" 2>/dev/null | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+process.stdout.write((d.workflow_rules||[]).some(r=>r.name==='prov_prov_idle_alert') ? 'yes' : 'no');
+")
+  [ "$WF_EXISTS" = "yes" ] && pass "live Zoho: workflow rule visible via independent REST query" || fail "Zoho workflow REST verify" "got $WF_EXISTS"
+
+  # round_robin_assignment stays MANUAL — plan should still show 'unsupported' with a note
+  RR_DELTA='{"spec_version":0,"fields":[],"stages":[],"pipelines":[],"workflows":[{"shape":"round_robin_assignment","api_name":"prov_rr","module":"Lead","pool":["a@x.com","b@x.com"]}]}'
+  R=$(mcp_call 70 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$RR_DELTA}}" | text_of)
+  RR_NOTE=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_workflow:round_robin_assignment');
+process.stdout.write((s?.notes||'').includes('Deluge') ? 'yes' : 'no');
+")
+  [ "$RR_NOTE" = "yes" ] && pass "live Zoho: round_robin still UNSUPPORTED with Deluge guidance note" || fail "round_robin manual note" "got $RR_NOTE"
 else
   echo "  (ZOHO_LIVE=0 — live Zoho assertions skipped. Run 'ZOHO_LIVE=1 bash scripts/smoke-p0.sh' to exercise.)"
 fi
