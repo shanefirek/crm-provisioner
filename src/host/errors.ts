@@ -113,6 +113,31 @@ export class LogicError extends CrmProvisionerError {
 }
 
 // ----------------------------------------------------------------------------
+// WatchdogError — quality metric (failure-rate or silent-success) tripped mid-run
+// ----------------------------------------------------------------------------
+
+export type WatchdogKind = "failure_rate" | "silent_success_rate";
+
+export class WatchdogError extends CrmProvisionerError {
+  readonly category = "WatchdogError" as const;
+  readonly retryable = false;
+  readonly kind: WatchdogKind;
+  readonly window: number;
+  readonly observed: number;
+
+  constructor(args: { kind: WatchdogKind; message: string; window: number; observed: number }) {
+    super(args.message);
+    this.kind = args.kind;
+    this.window = args.window;
+    this.observed = args.observed;
+  }
+
+  get typedCode(): string {
+    return `WatchdogError:${this.kind}`;
+  }
+}
+
+// ----------------------------------------------------------------------------
 // retryBoundary — exponential jittered backoff per the retry decision matrix
 // ----------------------------------------------------------------------------
 

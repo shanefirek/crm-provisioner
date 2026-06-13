@@ -21,6 +21,7 @@ import type {
   Plan,
   PlanStep,
   RunStepRecord,
+  ShouldAbortFn,
   StepResult,
 } from "./types.ts";
 
@@ -523,9 +524,10 @@ export const zohoAdapter: Adapter = {
     return planSpec(conn, spec, snap as Snapshot);
   },
 
-  async apply(conn, plan, onStep): Promise<ApplyResult> {
+  async apply(conn, plan, onStep, shouldAbort?: ShouldAbortFn): Promise<ApplyResult> {
     const results: StepResult[] = [];
     let failed = false;
+    let aborted_by: string | undefined;
     // Fresh snapshot for any step that needs id lookups (stage_field_id, layout_id, etc.)
     const snap = await snapshot(conn);
 
@@ -545,6 +547,10 @@ export const zohoAdapter: Adapter = {
     }
 
     for (const step of plan.steps) {
+      if (aborted_by) {
+        const r: StepResult = { seq: step.seq, status: "skipped_by_watchdog", result: { reason: aborted_by } };
+        results.push(r); onStep(r); continue;
+      }
       // Stage step results were pushed by the batch above
       if (step.operation === "add_stage") {
         if (results.some((r) => r.seq === step.seq)) continue;
@@ -593,8 +599,11 @@ export const zohoAdapter: Adapter = {
         const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
         results.push(r); onStep(r);
       }
+      const verdict = shouldAbort?.();
+      if (verdict) aborted_by = verdict.reason;
     }
 
+    if (aborted_by) return { status: "aborted", steps: results, aborted_by };
     return { status: failed ? "partial" : "succeeded", steps: results };
   },
 

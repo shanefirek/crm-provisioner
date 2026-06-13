@@ -21,6 +21,7 @@ import type {
   Plan,
   PlanStep,
   RunStepRecord,
+  ShouldAbortFn,
   StepResult,
 } from "./types.ts";
 
@@ -512,9 +513,10 @@ export const salesforceAdapter: Adapter = {
     return planSpec(conn, spec, snap as Snapshot);
   },
 
-  async apply(conn, plan, onStep): Promise<ApplyResult> {
+  async apply(conn, plan, onStep, shouldAbort?: ShouldAbortFn): Promise<ApplyResult> {
     const results: StepResult[] = [];
     let failed = false;
+    let aborted_by: string | undefined;
 
     // Batch stages — collect first, deploy once.
     const stageBatch: StagePayload[] = [];
@@ -536,6 +538,10 @@ export const salesforceAdapter: Adapter = {
     }
 
     for (const step of plan.steps) {
+      if (aborted_by) {
+        const r: StepResult = { seq: step.seq, status: "skipped_by_watchdog", result: { reason: aborted_by } };
+        results.push(r); onStep(r); continue;
+      }
       // Stage steps either succeeded as part of the batch above, or were already pushed as failures
       if (step.operation === "add_stage") {
         if (results.some((r) => r.seq === step.seq)) continue;
@@ -582,8 +588,12 @@ export const salesforceAdapter: Adapter = {
         const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
         results.push(r); onStep(r);
       }
+      // P7: watchdog check between steps.
+      const verdict = shouldAbort?.();
+      if (verdict) aborted_by = verdict.reason;
     }
 
+    if (aborted_by) return { status: "aborted", steps: results, aborted_by };
     return { status: failed ? "partial" : "succeeded", steps: results };
   },
 

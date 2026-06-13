@@ -24,6 +24,7 @@ import type {
   Plan,
   PlanStep,
   RunStepRecord,
+  ShouldAbortFn,
   StepResult,
 } from "./types.ts";
 
@@ -52,6 +53,17 @@ const INSTANCES = new Map<string, Snapshot>();
 // Per-connection counter for "throw then succeed" — keyed by (conn_id, api_name).
 // Reset implicitly when the connection is dropped (process restart).
 const THEN_SUCCEED_COUNTERS = new Map<string, number>();
+
+/**
+ * P7 synthetic-silent-success: when api_name starts with `test__silent_success`,
+ * the memory adapter returns successfully but does NOT mutate the snapshot AND
+ * returns a noop-shaped result — even though the plan said "create". The host
+ * watchdog detects this as a silent failure (vendor reporting success while
+ * dropping the write) and trips.
+ */
+function isSilentSuccessTest(apiName: string): boolean {
+  return apiName.startsWith("test__silent_success");
+}
 
 function maybeThrowForTest(connId: string, apiName: string): void {
   if (apiName.startsWith("test__throw_boundary_transient")) {
@@ -154,12 +166,18 @@ export const memoryAdapter: Adapter = {
     return { spec_hash: "", steps, unsupported_count, destructive_count };
   },
 
-  async apply(conn, plan, onStep): Promise<ApplyResult> {
+  async apply(conn, plan, onStep, shouldAbort?: ShouldAbortFn): Promise<ApplyResult> {
     const snap = snapFor(conn.id);
     const results: StepResult[] = [];
     let failed = false;
+    let aborted_by: string | undefined;
 
     for (const step of plan.steps) {
+      // P7: watchdog check BEFORE processing each step (after noop/skip filters below).
+      if (aborted_by) {
+        const r: StepResult = { seq: step.seq, status: "skipped_by_watchdog", result: { reason: aborted_by } };
+        results.push(r); onStep(r); continue;
+      }
       if (step.diff === "noop") {
         const r: StepResult = { seq: step.seq, status: "succeeded", result: { noop: true } };
         results.push(r); onStep(r); continue;
@@ -173,6 +191,19 @@ export const memoryAdapter: Adapter = {
         const r: StepResult = { seq: step.seq, status: "skipped_blocked", result: { reason: step.notes } };
         results.push(r); onStep(r); continue;
       }
+      // P7: silent-success test prefix returns success-with-noop without mutating state.
+      if (step.operation === "create_field") {
+        const f = step.payload as { module: string; api_name: string };
+        if (isSilentSuccessTest(f.api_name)) {
+          const r: StepResult = { seq: step.seq, status: "succeeded", result: { noop: true } };
+          results.push(r); onStep(r);
+          // Check watchdog AFTER the silent-success outcome was reported.
+          const verdict = shouldAbort?.();
+          if (verdict) aborted_by = verdict.reason;
+          continue;
+        }
+      }
+
       try {
         // P5: wrap the operation in retryBoundary so BoundaryError:transient is retried
         // (per the retry decision matrix). DataError and BoundaryError:permanent are not.
@@ -216,8 +247,12 @@ export const memoryAdapter: Adapter = {
         };
         results.push(r); onStep(r);
       }
+      // P7: watchdog check after each step's outcome was reported.
+      const verdict = shouldAbort?.();
+      if (verdict) aborted_by = verdict.reason;
     }
 
+    if (aborted_by) return { status: "aborted", steps: results, aborted_by };
     return { status: failed ? "partial" : "succeeded", steps: results };
   },
 

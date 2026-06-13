@@ -17,6 +17,7 @@ import {
   recordPermanentFailure,
   unblockSteps,
 } from "./permanent_failures.ts";
+import { WatchdogTracker } from "./watchdog.ts";
 
 type CachedPlan = { plan: Plan; conn_id: string; spec: ProvisionSpec };
 const PLAN_CACHE = new Map<string, CachedPlan>();
@@ -278,8 +279,14 @@ export function buildMcpServer(): McpServer {
         const stepWrites: Array<Promise<unknown>> = [];
         // P6: collect permanent-failure inserts to flush after the run row commits.
         const cacheWrites: Array<{ operation: string; payload: unknown; errorCode: string; errorMessage: string }> = [];
+        // P7: watchdog tracks failure-rate and silent-success-rate over a trailing window.
+        const watchdog = new WatchdogTracker();
+        let watchdog_trip_reason: string | null = null;
         const adapter = adapterFor(conn.crm);
-        const result = await adapter.apply(conn, cached.plan, (step) => {
+        const result = await adapter.apply(
+          conn,
+          cached.plan,
+          (step) => {
           const planStep = cached.plan.steps[step.seq - 1];
           // Record permanent-failure for cacheable error codes.
           if (step.status === "failed" && isCacheableFailure(step.error?.code) && planStep) {
@@ -289,6 +296,14 @@ export function buildMcpServer(): McpServer {
               errorCode: step.error!.code,
               errorMessage: step.error!.message,
             });
+          }
+          // P7: feed each step result to the watchdog tracker. Don't double-count
+          // watchdog-already-skipped steps (those came from the abort cascade).
+          if (step.status !== "skipped_by_watchdog") {
+            const verdict = watchdog.observe(cached.plan, step);
+            if (verdict.tripped && !watchdog_trip_reason) {
+              watchdog_trip_reason = `WatchdogError:${verdict.kind} — ${verdict.message}`;
+            }
           }
           stepWrites.push(
             client.query(
@@ -309,7 +324,10 @@ export function buildMcpServer(): McpServer {
               ],
             ),
           );
-        });
+        },
+        // P7: shouldAbort — adapter calls this between steps; truthy result aborts.
+        () => (watchdog_trip_reason ? { reason: watchdog_trip_reason } : null),
+        );
         await Promise.all(stepWrites);
 
         // P6: persist permanent-failure cache rows AFTER step rows so a single rollback
@@ -325,13 +343,27 @@ export function buildMcpServer(): McpServer {
           });
         }
 
-        await client.query(`update runs set status = $1, finished_at = extract(epoch from now())::integer where id = $2`, [result.status, run_id]);
+        await client.query(
+          `update runs set status = $1, finished_at = extract(epoch from now())::integer, aborted_by = $2, watchdog_window_failures = $3 where id = $4`,
+          [result.status, result.aborted_by ?? null, watchdog.failuresInWindow(), run_id],
+        );
         await client.query("commit");
 
         PLAN_CACHE.delete(plan_id);
 
         return ok(
-          JSON.stringify({ ok: true, run_id, trace_id, status: result.status, step_count: result.steps.length }, null, 2),
+          JSON.stringify(
+            {
+              ok: true,
+              run_id,
+              trace_id,
+              status: result.status,
+              step_count: result.steps.length,
+              aborted_by: result.aborted_by ?? null,
+            },
+            null,
+            2,
+          ),
         );
       } catch (e) {
         await client.query("rollback");
@@ -352,7 +384,7 @@ export function buildMcpServer(): McpServer {
     },
     async ({ run_id }) => {
       const r = await db.query(
-        `select id, connection_id, spec_hash, template_id, template_version, status, trace_id, started_at, finished_at, teardown_of_run
+        `select id, connection_id, spec_hash, template_id, template_version, status, trace_id, started_at, finished_at, teardown_of_run, aborted_by, watchdog_window_failures
            from runs where id = $1`,
         [run_id],
       );
@@ -375,6 +407,8 @@ export function buildMcpServer(): McpServer {
               spec_hash: run.spec_hash,
               template: run.template_id ? `${run.template_id}@${run.template_version}` : null,
               teardown_of_run: run.teardown_of_run,
+              aborted_by: run.aborted_by,
+              watchdog_window_failures: run.watchdog_window_failures,
               started_at: run.started_at,
               finished_at: run.finished_at,
             },

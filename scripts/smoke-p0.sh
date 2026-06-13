@@ -338,6 +338,77 @@ CLEARED=$(echo "$R" | field_of cache_entries_cleared)
 AFTER_CACHE=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -t -A -c "select count(*) from permanent_failures where connection_id='$P6_TD_CONN' and payload_hash='$PAYLOAD_HASH';")
 [ "$AFTER_CACHE" = "0" ] && pass "P6: cache row is gone after teardown (next create attempt unblocked)" || fail "P6 cache row post-teardown" "got count=$AFTER_CACHE"
 
+# ---- P7: quality watchdog over the run ----
+# Trip conditions (defaults: window=10, threshold=0.5, min_steps=5):
+#   (a) 6 of 10 failures → trips with WatchdogError:failure_rate
+#   (b) 4 of 10 failures → does NOT trip
+#   (c) 10 silent-success steps (succeed with noop when plan said create) → trips
+#       with WatchdogError:silent_success_rate
+echo "== P7: quality watchdog =="
+
+# (a) 6-of-10 failure-rate scenario.
+# 6 test__throw_data_error fields + 4 plain fields; min_steps=5 must be exceeded
+# before watchdog can trip — by seq 6 the trailing window is [F F F F F F]:6/6=100% → TRIPS.
+R=$(mcp_call 110 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p7-fr","is_demo":true,"api_domain":"memory://p7fr","writable_org_ids":["memory://p7fr"]}}' | text_of)
+P7_CONN=$(echo "$R" | field_of connection_id)
+P7_FAIL_DELTA=$(node -e "
+const fields=[];
+// 6 failure-triggers first (so watchdog trips while there's still steps remaining)
+for (let i=1;i<=6;i++) fields.push({api_name:'test__throw_data_error_p7_f'+i,label:'x',kind:'text',module:'Lead'});
+// Then 4 plain (would-succeed) steps that should be skipped_by_watchdog
+for (let i=1;i<=4;i++) fields.push({api_name:'p7_plain_field_'+i,label:'x',kind:'text',module:'Lead'});
+process.stdout.write(JSON.stringify({spec_version:0,fields,stages:[],pipelines:[],workflows:[]}));
+")
+R=$(mcp_call 111 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P7_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P7_FAIL_DELTA}}" | text_of)
+P7_PLAN_FR=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 112 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P7_PLAN_FR\"}}" | text_of)
+P7_RUN_FR=$(echo "$R" | field_of run_id)
+P7_STATUS_FR=$(echo "$R" | field_of status)
+P7_ABORT_FR=$(echo "$R" | field_of aborted_by)
+[ "$P7_STATUS_FR" = "aborted" ] && pass "P7: 6-of-N failures → run status = aborted" || fail "P7 failure-rate status" "got '$P7_STATUS_FR'"
+echo "$P7_ABORT_FR" | grep -q 'WatchdogError:failure_rate' && pass "P7: aborted_by names failure_rate" || fail "P7 aborted_by" "got '$P7_ABORT_FR'"
+
+# Check that at least one downstream step was skipped_by_watchdog
+R=$(mcp_call 113 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$P7_RUN_FR\"}}" | text_of)
+SKIPPED=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+process.stdout.write(String((d.steps||[]).filter(s=>s.status==='skipped_by_watchdog').length));
+")
+[ "$SKIPPED" -ge 1 ] && pass "P7: downstream steps marked skipped_by_watchdog ($SKIPPED of them)" || fail "P7 skipped count" "got $SKIPPED"
+
+# (b) 4-of-10 — should NOT trip (4/10 = 40% < 50% threshold; watchdog stays quiet)
+R=$(mcp_call 114 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p7-nt","is_demo":true,"api_domain":"memory://p7nt","writable_org_ids":["memory://p7nt"]}}' | text_of)
+P7_CONN_NT=$(echo "$R" | field_of connection_id)
+P7_NOT_DELTA=$(node -e "
+const fields=[];
+// Order matters: successes FIRST so the trailing window never hits >50% failure rate.
+// Final window across 10 fields: [S S S S S S F F F F] = 40%.
+for (let i=1;i<=6;i++) fields.push({api_name:'p7nt_plain_field_'+i,label:'x',kind:'text',module:'Lead'});
+for (let i=1;i<=4;i++) fields.push({api_name:'test__throw_data_error_p7_nt'+i,label:'x',kind:'text',module:'Lead'});
+process.stdout.write(JSON.stringify({spec_version:0,fields,stages:[],pipelines:[],workflows:[]}));
+")
+R=$(mcp_call 115 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P7_CONN_NT\",\"template_ref\":\"toy-sales\",\"delta\":$P7_NOT_DELTA}}" | text_of)
+P7_PLAN_NT=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 116 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P7_PLAN_NT\"}}" | text_of)
+P7_STATUS_NT=$(echo "$R" | field_of status)
+[ "$P7_STATUS_NT" = "partial" ] && pass "P7: 4-of-10 failures stays 'partial' (under threshold, watchdog quiet)" || fail "P7 under-threshold" "got '$P7_STATUS_NT'"
+
+# (c) silent-success — 10 fields that succeed with noop when plan said create
+R=$(mcp_call 117 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p7-ss","is_demo":true,"api_domain":"memory://p7ss","writable_org_ids":["memory://p7ss"]}}' | text_of)
+P7_CONN_SS=$(echo "$R" | field_of connection_id)
+P7_SS_DELTA=$(node -e "
+const fields=[];
+for (let i=1;i<=10;i++) fields.push({api_name:'test__silent_success_p7ss'+i,label:'x',kind:'text',module:'Lead'});
+process.stdout.write(JSON.stringify({spec_version:0,fields,stages:[],pipelines:[],workflows:[]}));
+")
+R=$(mcp_call 118 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P7_CONN_SS\",\"template_ref\":\"toy-sales\",\"delta\":$P7_SS_DELTA}}" | text_of)
+P7_PLAN_SS=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 119 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P7_PLAN_SS\"}}" | text_of)
+P7_STATUS_SS=$(echo "$R" | field_of status)
+P7_ABORT_SS=$(echo "$R" | field_of aborted_by)
+[ "$P7_STATUS_SS" = "aborted" ] && pass "P7: silent-success run aborts" || fail "P7 silent-success status" "got '$P7_STATUS_SS'"
+echo "$P7_ABORT_SS" | grep -q 'WatchdogError:silent_success_rate' && pass "P7: aborted_by names silent_success_rate" || fail "P7 silent aborted_by" "got '$P7_ABORT_SS'"
+
 # ---- 15. health ----
 echo "== /health =="
 H=$(curl -sS "$BASE/health")

@@ -34,16 +34,21 @@ export type Plan = {
 
 export type StepResult = {
   seq: number;
-  status: "succeeded" | "failed" | "skipped_unsupported" | "skipped_blocked";
+  status: "succeeded" | "failed" | "skipped_unsupported" | "skipped_blocked" | "skipped_by_watchdog";
   result?: unknown;
   /** error.code is the typed-class string (e.g. "BoundaryError:transient", "DataError:DUPLICATE_DATA"). */
   error?: { code: string; message: string; attempts?: number };
 };
 
 export type ApplyResult = {
-  status: "succeeded" | "failed" | "partial";
+  status: "succeeded" | "failed" | "partial" | "aborted";
   steps: StepResult[];
+  /** Set when the host's watchdog tripped the run; carries the reason. */
+  aborted_by?: string;
 };
+
+/** Host → adapter watchdog callback. Adapters check between steps; truthy return aborts. */
+export type ShouldAbortFn = () => { reason: string } | null;
 
 export type ConnectionContext = {
   id: string;
@@ -79,7 +84,11 @@ export interface Adapter {
   plan(conn: ConnectionContext, spec: ProvisionSpec, snapshot: unknown): Promise<Plan>;
 
   // Execute steps in order; emit per-step results. Idempotency owned by the adapter.
-  apply(conn: ConnectionContext, plan: Plan, onStep: (step: StepResult) => void): Promise<ApplyResult>;
+  // shouldAbort (optional, P7): host-provided watchdog check. Adapters consult it
+  // BEFORE each non-noop, non-skipped step. If it returns a {reason}, the adapter
+  // must mark all remaining steps skipped_by_watchdog and return ApplyResult with
+  // status='aborted' and aborted_by set to that reason.
+  apply(conn: ConnectionContext, plan: Plan, onStep: (step: StepResult) => void, shouldAbort?: ShouldAbortFn): Promise<ApplyResult>;
 
   // Reverse the successful steps of a previous run, newest-first.
   // The driver supplies the run's step history; adapter decides per-op how to reverse.
