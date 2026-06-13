@@ -32,10 +32,18 @@ const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
 const trace = () => crypto.randomUUID();
 
 async function loadConn(id: string): Promise<ConnectionContext | null> {
+  // P14: decrypt token columns at read time. The encryption key never crosses the
+  // application boundary — pgp_sym_decrypt runs in Postgres with the key passed as
+  // a parameter. NULL ciphertext stays NULL (legacy rows pre-P14 read as no-token
+  // and the adapter will fall over with an instructive error if it tries to mint).
+  const key = process.env.TOKEN_AT_REST_KEY!;  // guaranteed set by server boot check
   const { rows } = await db.query(
-    `select id, crm, dc, api_domain, is_demo, writable_org_ids, refresh_token, access_token, access_expires
+    `select id, crm, dc, api_domain, is_demo, writable_org_ids, sf_alias,
+            pgp_sym_decrypt(refresh_token_encrypted, $2)::text as refresh_token,
+            pgp_sym_decrypt(access_token_encrypted, $2)::text as access_token,
+            access_expires
        from connections where id = $1`,
-    [id],
+    [id, key],
   );
   return rows[0] ?? null;
 }
@@ -116,9 +124,10 @@ export function buildMcpServer(): McpServer {
         access_token: z.string().optional().describe("P2 dev only — paste an existing token. P3 host work replaces with OAuth callback."),
         refresh_token: z.string().optional().describe("Zoho: required for the adapter to mint access tokens from the refresh_token grant."),
         dc: z.string().optional().describe("Zoho only — datacenter ('com' | 'eu' | 'in' | 'com.au'). Determines accounts.zoho.{dc} host for OAuth refresh."),
+        sf_alias: z.string().optional().describe("Salesforce only — the `sf` CLI alias to use for this connection (e.g. 'shane-dev'). Per-connection multi-tenancy: every concurrent apply uses this alias rather than the process-global SF_ALIAS env var. Defaults to env fallback when unset."),
       },
     },
-    async ({ crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token, dc }) => {
+    async ({ crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token, dc, sf_alias }) => {
       // P10 fix #5: Zoho api_domain is per-DC tenant config (tier-2). The token-exchange
       // response returns it; without it the adapter silently falls back to zohoapis.com
       // and every API call for an EU/IN/AU customer 404s. Fail-at-boot, not fall-back —
@@ -134,12 +143,32 @@ export function buildMcpServer(): McpServer {
         );
       }
       const id = crypto.randomUUID();
+      // P14: encrypt token columns at write time. case-when keeps NULL→NULL semantic so
+      // memory-adapter connections (which carry no tokens) don't pay pgcrypto's ceremony.
+      const key = process.env.TOKEN_AT_REST_KEY!;
       await db.query(
-        `insert into connections (id, crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token, dc)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [id, crm, org_label ?? `${crm} connection`, is_demo, writable_org_ids, api_domain ?? null, access_token ?? null, refresh_token ?? null, dc ?? null],
+        `insert into connections
+           (id, crm, org_label, is_demo, writable_org_ids, api_domain,
+            access_token_encrypted, refresh_token_encrypted, dc, sf_alias)
+           values ($1, $2, $3, $4, $5, $6,
+            case when $7::text is null then null else pgp_sym_encrypt($7::text, $10::text) end,
+            case when $8::text is null then null else pgp_sym_encrypt($8::text, $10::text) end,
+            $9, $11)`,
+        [
+          id,
+          crm,
+          org_label ?? `${crm} connection`,
+          is_demo,
+          writable_org_ids,
+          api_domain ?? null,
+          access_token ?? null,
+          refresh_token ?? null,
+          dc ?? null,
+          key,
+          sf_alias ?? null,
+        ],
       );
-      return ok(JSON.stringify({ connection_id: id, crm, is_demo, writable_org_ids, api_domain: api_domain ?? null, dc: dc ?? null }, null, 2));
+      return ok(JSON.stringify({ connection_id: id, crm, is_demo, writable_org_ids, api_domain: api_domain ?? null, dc: dc ?? null, sf_alias: sf_alias ?? null }, null, 2));
     },
   );
 

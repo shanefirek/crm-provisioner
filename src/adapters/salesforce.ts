@@ -392,9 +392,16 @@ ${values.map((v) => `  <standardValue>
   });
 }
 
-function inferAlias(_conn: ConnectionContext): string {
-  // For P2 dev, the alias is the CLI's local org alias; default shane-dev.
-  // P3 replaces with the OAuth-acquired connection identity (the api_domain + a refresh token).
+function inferAlias(conn: ConnectionContext): string {
+  // P12: per-connection alias takes precedence over the process-global env var.
+  // Multi-tenancy-isolation: two concurrent applies on different connections route
+  // to their own CLI aliases. Env-var fallback stays for the one-builder demo path
+  // where pre-P12 connections were created without sf_alias. P3 replaces all of
+  // this with OAuth-acquired connection identity + direct Bearer fetch.
+  if (conn.sf_alias) return conn.sf_alias;
+  if (process.env.SF_ALIAS_WARN_LEGACY === "1") {
+    process.stderr.write(`[sf-adapter] WARN: falling back to SF_ALIAS env for connection ${conn.id} — set sf_alias on the connection.\n`);
+  }
   return process.env.SF_ALIAS || "shane-dev";
 }
 
@@ -700,15 +707,28 @@ export const salesforceAdapter: Adapter = {
       if (step.operation === "add_stage" && step.diff !== "noop") stageBatch.push(step.payload as StagePayload);
     }
     if (stageBatch.length) {
-      try {
-        await retryBoundary(() => deployStandardValueSet(conn, stageBatch));
-      }
-      catch (e) {
-        failed = true;
-        const d = describeThrown(e);
+      // P12: check shouldAbort BEFORE initiating the batch deploy (metadata deploys take
+      // 10-30s and commit a real write). Defense-in-depth even though today's watchdog
+      // can't trip before the loop runs — the contract is "writes are gated on watchdog,"
+      // and the batch is a write. error-handling-philosophy + watchdog rule.
+      const preVerdict = shouldAbort?.();
+      if (preVerdict) {
+        aborted_by = preVerdict.reason;
         for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
-          const r: StepResult = { seq: s.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
+          const r: StepResult = { seq: s.seq, status: "skipped_by_watchdog", result: { reason: preVerdict.reason } };
           results.push(r); onStep(r);
+        }
+      } else {
+        try {
+          await retryBoundary(() => deployStandardValueSet(conn, stageBatch));
+        }
+        catch (e) {
+          failed = true;
+          const d = describeThrown(e);
+          for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
+            const r: StepResult = { seq: s.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
+            results.push(r); onStep(r);
+          }
         }
       }
     }

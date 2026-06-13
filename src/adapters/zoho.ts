@@ -116,6 +116,10 @@ async function zoho(
 
 type Snapshot = {
   fields_lead: Array<{ id: string; api_name: string }>;
+  // P12: Deals custom fields. Previously the teardown branch for non-Leads modules
+  // re-fetched a full snapshot AND mis-aliased `fields_lead` for Deals lookups (audit
+  // finding #4 + a side-effect bug — Deals teardown lookups never resolved).
+  fields_deals: Array<{ id: string; api_name: string }>;
   stages: Array<{ id: string; api_name: string; probability: number; forecast_category_id: string; forecast_category_name: string }>;
   pipelines: Array<{ id: string; api_name: string }>;
   stage_field_id: string | null;
@@ -129,8 +133,8 @@ async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
     .map((f) => ({ id: f.id, api_name: f.api_name }));
 
   const dealFields = await zoho(conn, "/crm/v8/settings/fields?module=Deals");
-  const stageField = ((dealFields.body as { fields?: Array<{ id: string; api_name: string; pick_list_values?: Array<{ id: string; actual_value: string; probability: number; forecast_category?: { id: string; name: string } }> }> })?.fields ?? [])
-    .find((f) => f.api_name === "Stage");
+  const dealFieldList = ((dealFields.body as { fields?: Array<{ id: string; api_name: string; pick_list_values?: Array<{ id: string; actual_value: string; probability: number; forecast_category?: { id: string; name: string } }> }> })?.fields ?? []);
+  const stageField = dealFieldList.find((f) => f.api_name === "Stage");
   const stages = (stageField?.pick_list_values ?? []).map((v) => ({
     id: v.id,
     api_name: v.actual_value,
@@ -138,6 +142,8 @@ async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
     forecast_category_id: v.forecast_category?.id ?? "",
     forecast_category_name: v.forecast_category?.name ?? "Pipeline",
   }));
+  // P12: Deals custom-field index for teardown of Deal-module fields.
+  const fields_deals = dealFieldList.filter((f) => !!f.api_name).map((f) => ({ id: f.id, api_name: f.api_name }));
 
   const layouts = await zoho(conn, "/crm/v8/settings/layouts?module=Deals");
   const default_deals_layout_id = (((layouts.body as { layouts?: Array<{ id: string; status: string }> })?.layouts) ?? [])
@@ -152,7 +158,7 @@ async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
     }));
   }
 
-  return { fields_lead, stages, pipelines, stage_field_id: stageField?.id ?? null, default_deals_layout_id };
+  return { fields_lead, fields_deals, stages, pipelines, stage_field_id: stageField?.id ?? null, default_deals_layout_id };
 }
 
 // --- Planning --------------------------------------------------------------
@@ -541,14 +547,27 @@ export const zohoAdapter: Adapter = {
     // Batch stages: collect first, single PATCH.
     const stageBatch = plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop").map((s) => s.payload as StageSpec);
     if (stageBatch.length) {
-      try {
-        await addStages(conn, stageBatch, snap);
-      } catch (e) {
-        failed = true;
+      // P12: gate the batch on shouldAbort BEFORE dispatching the PATCH (defense in depth;
+      // contract is "writes are gated on watchdog," batch is a write). Mirrors the SFDC
+      // adapter's pre-batch check. Audit finding #2.
+      const preVerdict = shouldAbort?.();
+      if (preVerdict) {
+        aborted_by = preVerdict.reason;
         for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
-          const d = describeThrown(e);
-          const r: StepResult = { seq: s.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
+          const r: StepResult = { seq: s.seq, status: "skipped_by_watchdog", result: { reason: preVerdict.reason } };
           results.push(r); onStep(r);
+        }
+      } else {
+        try {
+          // P10: retry boundary errors (5xx, 429); raise DataError immediately.
+          await retryBoundary(() => addStages(conn, stageBatch, snap));
+        } catch (e) {
+          failed = true;
+          for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
+            const d = describeThrown(e);
+            const r: StepResult = { seq: s.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
+            results.push(r); onStep(r);
+          }
         }
       }
     }
@@ -617,14 +636,22 @@ export const zohoAdapter: Adapter = {
   async teardown(conn, steps, onStep): Promise<ApplyResult> {
     const results: StepResult[] = [];
     const reverse = [...steps].filter((s) => s.status === "succeeded").reverse();
+    // P12: single snapshot for the whole teardown. Previously the non-Leads field branch
+    // triggered a second full snapshot per Deals field (O(N) extra round-trips) AND looked
+    // up against the wrong array (Lead-only). Audit finding #4. The combined snapshot now
+    // carries both fields_lead AND fields_deals.
     const snap = await snapshot(conn);
+    let snapshotFetchCount = 1;
+    if (process.env.ZOHO_DEBUG_TEARDOWN === "1") {
+      process.stderr.write(`[zoho-teardown] initial snapshot fetched (1)\n`);
+    }
     for (const step of reverse) {
       try {
         if (step.operation === "create_field") {
           const f = step.payload as FieldPayload;
           const moduleApi = f.module === "Lead" ? "Leads" : f.module === "Deal" ? "Deals" : f.module;
-          // Look up id by api_name (snapshot of the proper module)
-          const list = moduleApi === "Leads" ? snap.fields_lead : (await snapshot(conn)).fields_lead;
+          // P12: per-module field index, no second snapshot fetch.
+          const list = moduleApi === "Leads" ? snap.fields_lead : moduleApi === "Deals" ? snap.fields_deals : [];
           const target = list.find((x) => x.api_name === f.api_name);
           if (!target) {
             const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "create_field", note: "already-absent" } };
@@ -645,6 +672,24 @@ export const zohoAdapter: Adapter = {
           // For MVP demo orgs the residue is acceptable; mark honestly.
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "add_stage", residue: "stage_picklist_value_remains" } };
           results.push(r); onStep(r);
+        } else if (step.operation.startsWith("create_workflow:")) {
+          // P12: workflow_rule teardown actually DELETEs the rule. Audit finding #7:
+          // previously this branch fell through to the silent-noop else clause; the rule
+          // stayed live in the org while the run ledger said "succeeded". ai-output-handling
+          // AP#8 applied at the teardown layer.
+          // The apply step's result stored {workflow_rule_id, ...}. If the id is missing
+          // (older runs pre-P12, or non-standard result shape), record honest residue.
+          const resultJson = step.result as { workflow_rule_id?: string } | null;
+          const wfId = resultJson?.workflow_rule_id;
+          if (!wfId) {
+            const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: step.operation, residue: "workflow_rule_id_missing", note: "older run without stored id — manual cleanup required" } };
+            results.push(r); onStep(r);
+          } else {
+            const del = await zoho(conn, `/crm/v8/settings/automation/workflow_rules/${wfId}`, { method: "DELETE" });
+            if (del.status >= 400) throw classifyZohoResponse({ status: del.status, body: del.body, retryAfterHeader: del.retryAfter });
+            const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: step.operation, deleted_workflow_rule_id: wfId } };
+            results.push(r); onStep(r);
+          }
         } else {
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: step.operation, note: "no-op or stub op" } };
           results.push(r); onStep(r);
@@ -654,6 +699,9 @@ export const zohoAdapter: Adapter = {
         const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
         results.push(r); onStep(r);
       }
+    }
+    if (process.env.ZOHO_DEBUG_TEARDOWN === "1") {
+      process.stderr.write(`[zoho-teardown] total snapshot fetches: ${snapshotFetchCount}\n`);
     }
     return { status: "succeeded", steps: results };
   },

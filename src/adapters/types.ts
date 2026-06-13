@@ -57,6 +57,10 @@ export type ConnectionContext = {
   dc?: string;                  // Zoho only: 'com' | 'eu' | 'in' | 'com.au'
   is_demo: boolean;
   writable_org_ids: string[];
+  // SFDC only (P12): the `sf` CLI alias to target. When set, the adapter uses this
+  // instead of the process-global SF_ALIAS env var. Multi-tenancy-isolation rule:
+  // alias is per-tenant. NULL = legacy fallback to env (one-builder demo path).
+  sf_alias?: string | null;
   // Adapter-specific auth bits stay opaque to the driver.
   refresh_token?: string;
   access_token?: string;
