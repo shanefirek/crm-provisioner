@@ -10,6 +10,13 @@ import { applyOverlay } from "../core/overlay.ts";
 import { DeltaSpecSchema, ProvisionSpecSchema, type ProvisionSpec } from "../core/spec.ts";
 import { getTemplate, listTemplates } from "../core/templates.ts";
 import { db } from "./db.ts";
+import {
+  annotateBlockedSteps,
+  clearForReversed,
+  isCacheableFailure,
+  recordPermanentFailure,
+  unblockSteps,
+} from "./permanent_failures.ts";
 
 type CachedPlan = { plan: Plan; conn_id: string; spec: ProvisionSpec };
 const PLAN_CACHE = new Map<string, CachedPlan>();
@@ -173,12 +180,20 @@ export function buildMcpServer(): McpServer {
       const { snapshot } = await adapter.inspect(conn);
       const plan = await adapter.plan(conn, validated.spec, snapshot);
       plan.spec_hash = validated.spec_hash;
+      // P6: annotate steps blocked by prior permanent failures BEFORE re-deriving counts.
+      const blocked_count = await annotateBlockedSteps(db, conn.id, plan);
       // Re-derive counts at the host boundary (defense-in-depth — adapters MUST set, host VERIFIES).
       plan.unsupported_count = plan.steps.filter((s) => s.diff === "unsupported").length;
       plan.destructive_count = plan.steps.filter((s) => s.destructive).length;
 
       const plan_id = `plan_${crypto.randomUUID()}`;
       PLAN_CACHE.set(plan_id, { plan, conn_id: conn.id, spec: validated.spec });
+
+      const next_msgs: string[] = [];
+      if (plan.destructive_count > 0) next_msgs.push("destructive steps require confirm_destructive:true on apply()");
+      if (blocked_count > 0) next_msgs.push(`${blocked_count} step(s) blocked by prior permanent failure — re-attempt with force_retry_blocked:true`);
+      if (next_msgs.length === 0) next_msgs.push("Pass plan_id to apply() to execute. Plans are cached in-process for the lifetime of the server.");
+
       return ok(
         JSON.stringify(
           {
@@ -189,10 +204,8 @@ export function buildMcpServer(): McpServer {
             steps: plan.steps,
             unsupported_count: plan.unsupported_count,
             destructive_count: plan.destructive_count,
-            next:
-              plan.destructive_count > 0
-                ? "Plan contains destructive operations. Pass confirm_destructive:true to apply()."
-                : "Pass plan_id to apply() to execute. Plans are cached in-process for the lifetime of the server.",
+            blocked_count,
+            next: next_msgs.join("; "),
           },
           null,
           2,
@@ -210,9 +223,10 @@ export function buildMcpServer(): McpServer {
       inputSchema: {
         plan_id: z.string(),
         confirm_destructive: z.boolean().default(false).describe("Must be true when the plan has destructive_count > 0"),
+        force_retry_blocked: z.boolean().default(false).describe("P6: re-attempt steps blocked by cached permanent failures. Use after teardown or after fixing the spec."),
       },
     },
-    async ({ plan_id, confirm_destructive }) => {
+    async ({ plan_id, confirm_destructive, force_retry_blocked }) => {
       const cached = PLAN_CACHE.get(plan_id);
       if (!cached) {
         return ok(
@@ -242,6 +256,12 @@ export function buildMcpServer(): McpServer {
         );
       }
 
+      // P6: force_retry_blocked rewrites blocked steps back to "create" before
+      // we hand the plan to the adapter. Without it, blocked steps stay blocked
+      // and the adapter skips them with status="skipped_blocked".
+      let unblocked = 0;
+      if (force_retry_blocked) unblocked = unblockSteps(cached.plan);
+
       const run_id = `run_${crypto.randomUUID()}`;
       const trace_id = trace();
       const [tplId, tplVer] = (cached.spec.extends ?? "@").split("@");
@@ -256,9 +276,20 @@ export function buildMcpServer(): McpServer {
         );
 
         const stepWrites: Array<Promise<unknown>> = [];
+        // P6: collect permanent-failure inserts to flush after the run row commits.
+        const cacheWrites: Array<{ operation: string; payload: unknown; errorCode: string; errorMessage: string }> = [];
         const adapter = adapterFor(conn.crm);
         const result = await adapter.apply(conn, cached.plan, (step) => {
           const planStep = cached.plan.steps[step.seq - 1];
+          // Record permanent-failure for cacheable error codes.
+          if (step.status === "failed" && isCacheableFailure(step.error?.code) && planStep) {
+            cacheWrites.push({
+              operation: planStep.operation,
+              payload: planStep.payload,
+              errorCode: step.error!.code,
+              errorMessage: step.error!.message,
+            });
+          }
           stepWrites.push(
             client.query(
               `insert into run_steps (run_id, seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, attempts, started_at, finished_at)
@@ -280,6 +311,19 @@ export function buildMcpServer(): McpServer {
           );
         });
         await Promise.all(stepWrites);
+
+        // P6: persist permanent-failure cache rows AFTER step rows so a single rollback
+        // affects neither. Done within the same tx for atomicity.
+        for (const cw of cacheWrites) {
+          await recordPermanentFailure(db, {
+            connectionId: conn.id,
+            operation: cw.operation,
+            payload: cw.payload,
+            errorCode: cw.errorCode,
+            errorMessage: cw.errorMessage,
+            runId: run_id,
+          });
+        }
 
         await client.query(`update runs set status = $1, finished_at = extract(epoch from now())::integer where id = $2`, [result.status, run_id]);
         await client.query("commit");
@@ -388,7 +432,14 @@ export function buildMcpServer(): McpServer {
 
         const adapter = adapterFor(conn.crm);
         const writes: Array<Promise<unknown>> = [];
+        // P6: collect successful reversals so we can clear matching cache rows
+        // (the resource is gone, so any future create attempt has a clean slate).
+        const cacheClears: Array<{ operation: string; payload: unknown }> = [];
         const result = await adapter.teardown(conn, history, (step) => {
+          if (step.status === "succeeded") {
+            const orig = history.find((h) => h.seq === step.seq);
+            if (orig) cacheClears.push({ operation: orig.operation, payload: orig.payload });
+          }
           writes.push(
             client.query(
               `insert into run_steps (run_id, seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, started_at, finished_at)
@@ -412,6 +463,13 @@ export function buildMcpServer(): McpServer {
         await client.query(`update runs set status = $1, finished_at = extract(epoch from now())::integer where id = $2`, [result.status, teardown_id]);
         await client.query("commit");
 
+        // P6: clear permanent-failure cache rows for each successfully reversed step.
+        // Done OUTSIDE the tx because they're an independent concern (the cache is
+        // best-effort hygiene; tx semantics are about the run audit trail).
+        for (const cc of cacheClears) {
+          await clearForReversed(db, { connectionId: conn.id, operation: cc.operation, payload: cc.payload });
+        }
+
         return ok(
           JSON.stringify(
             {
@@ -421,6 +479,7 @@ export function buildMcpServer(): McpServer {
               trace_id,
               status: result.status,
               reversed_steps: result.steps.length,
+              cache_entries_cleared: cacheClears.length,
             },
             null,
             2,

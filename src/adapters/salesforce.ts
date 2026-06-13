@@ -554,6 +554,10 @@ export const salesforceAdapter: Adapter = {
         const r: StepResult = { seq: step.seq, status: "skipped_unsupported" };
         results.push(r); onStep(r); continue;
       }
+      if (step.diff === "blocked_by_prior_failure") {
+        const r: StepResult = { seq: step.seq, status: "skipped_blocked", result: { reason: step.notes } };
+        results.push(r); onStep(r); continue;
+      }
 
       try {
         if (step.operation === "create_field") {

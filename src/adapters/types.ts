@@ -20,7 +20,7 @@ export type PlanStep = {
   operation: string;                  // 'create_field' | 'add_stage' | 'create_pipeline' | 'create_workflow:idle_deal_alert' | ...
   target?: string;                    // module / object label
   payload: unknown;                   // adapter-specific shape that apply() will execute
-  diff: "create" | "update" | "noop" | "unsupported";
+  diff: "create" | "update" | "noop" | "unsupported" | "blocked_by_prior_failure";
   destructive: boolean;               // true when the reverse-op is lossy (deactivates-not-deletes, deletes a stage that has records, etc.)
   notes?: string;                     // e.g. "marked unsupported by capability map: assignment_rules"
 };
@@ -34,7 +34,7 @@ export type Plan = {
 
 export type StepResult = {
   seq: number;
-  status: "succeeded" | "failed" | "skipped_unsupported";
+  status: "succeeded" | "failed" | "skipped_unsupported" | "skipped_blocked";
   result?: unknown;
   /** error.code is the typed-class string (e.g. "BoundaryError:transient", "DataError:DUPLICATE_DATA"). */
   error?: { code: string; message: string; attempts?: number };

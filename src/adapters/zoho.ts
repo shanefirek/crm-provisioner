@@ -562,6 +562,10 @@ export const zohoAdapter: Adapter = {
         const r: StepResult = { seq: step.seq, status: "skipped_unsupported", result: { reason: step.notes } };
         results.push(r); onStep(r); continue;
       }
+      if (step.diff === "blocked_by_prior_failure") {
+        const r: StepResult = { seq: step.seq, status: "skipped_blocked", result: { reason: step.notes } };
+        results.push(r); onStep(r); continue;
+      }
       try {
         if (step.operation === "create_field") {
           const res = await retryBoundary(() => createField(conn, step.payload as FieldPayload));

@@ -168,6 +168,11 @@ export const memoryAdapter: Adapter = {
         const r: StepResult = { seq: step.seq, status: "skipped_unsupported" };
         results.push(r); onStep(r); continue;
       }
+      if (step.diff === "blocked_by_prior_failure") {
+        // P6: prior permanent failure cached at the host. Skip cleanly here.
+        const r: StepResult = { seq: step.seq, status: "skipped_blocked", result: { reason: step.notes } };
+        results.push(r); onStep(r); continue;
+      }
       try {
         // P5: wrap the operation in retryBoundary so BoundaryError:transient is retried
         // (per the retry decision matrix). DataError and BoundaryError:permanent are not.

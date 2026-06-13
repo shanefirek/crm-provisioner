@@ -251,6 +251,93 @@ R=$(mcp_call 87 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$
 TS_STATUS=$(echo "$R" | field_of status)
 [ "$TS_STATUS" = "succeeded" ] && pass "P5: throw-then-succeed apply succeeds (retry recovered)" || fail "P5 throw-then-succeed" "got $TS_STATUS"
 
+# ---- P6: negative cache for permanent failures ----
+# After a DataError step fails (recorded in P5 above), a fresh plan against the
+# SAME field spec should mark the step blocked_by_prior_failure. force_retry_
+# blocked:true bypasses; teardown clears the cache; expired entries ignored.
+echo "== P6: negative cache for permanent failures =="
+# Use a dedicated connection to keep the cache state predictable.
+R=$(mcp_call 90 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p6-cache","is_demo":true,"api_domain":"memory://p6","writable_org_ids":["memory://p6"]}}' | text_of)
+P6_CONN=$(echo "$R" | field_of connection_id)
+P6_FIELD_NAME="test__throw_data_error_p6"
+P6_DELTA="{\"spec_version\":0,\"fields\":[{\"api_name\":\"$P6_FIELD_NAME\",\"label\":\"x\",\"kind\":\"text\",\"module\":\"Lead\"}],\"stages\":[],\"pipelines\":[],\"workflows\":[]}"
+
+# 1. First apply against the synthetic-data-error field → record permanent failure
+R=$(mcp_call 91 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P6_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P6_DELTA}}" | text_of)
+P6_PLAN1=$(echo "$R" | field_of plan_id)
+mcp_call 92 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P6_PLAN1\"}}" > /dev/null
+# Allow async cache write to settle (we await it in the handler, but stay safe).
+
+# 2. Second plan → step for that field should now be blocked_by_prior_failure
+R=$(mcp_call 93 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P6_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P6_DELTA}}" | text_of)
+P6_PLAN2=$(echo "$R" | field_of plan_id)
+BLOCKED_COUNT=$(echo "$R" | field_of blocked_count)
+[ "$BLOCKED_COUNT" -ge 1 ] && pass "P6: second plan reports blocked_count >= 1" || fail "P6 blocked_count" "got $BLOCKED_COUNT"
+BLOCKED_DIFF=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field' && x.payload?.api_name==='$P6_FIELD_NAME');
+process.stdout.write(JSON.stringify({diff:s?.diff, notes:s?.notes?.slice(0,80)}));
+")
+echo "$BLOCKED_DIFF" | grep -q '"diff":"blocked_by_prior_failure"' && pass "P6: matching step diff = blocked_by_prior_failure" || fail "P6 diff" "$BLOCKED_DIFF"
+echo "$BLOCKED_DIFF" | grep -q '"notes":"BLOCKED' && pass "P6: notes carry the BLOCKED explanation with original error" || fail "P6 notes" "$BLOCKED_DIFF"
+
+# 3. Apply that blocked plan without force_retry_blocked → step status = skipped_blocked
+R=$(mcp_call 94 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P6_PLAN2\"}}" | text_of)
+P6_RUN_BLOCKED=$(echo "$R" | field_of run_id)
+R=$(mcp_call 95 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$P6_RUN_BLOCKED\"}}" | text_of)
+BLOCKED_STATUS=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field');
+process.stdout.write(s?.status || 'missing');
+")
+[ "$BLOCKED_STATUS" = "skipped_blocked" ] && pass "P6: blocked step apply records status = skipped_blocked" || fail "P6 skipped_blocked status" "got '$BLOCKED_STATUS'"
+
+# 4. Apply with force_retry_blocked:true → step is re-attempted (still synthetic-throws so it fails again, but it attempted)
+R=$(mcp_call 96 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P6_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P6_DELTA}}" | text_of)
+P6_PLAN_FORCE=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 97 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P6_PLAN_FORCE\",\"force_retry_blocked\":true}}" | text_of)
+P6_RUN_FORCED=$(echo "$R" | field_of run_id)
+R=$(mcp_call 98 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$P6_RUN_FORCED\"}}" | text_of)
+FORCED_STATUS=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field');
+process.stdout.write(JSON.stringify({status:s?.status, code:s?.error_code}));
+")
+echo "$FORCED_STATUS" | grep -q '"status":"failed"' && pass "P6: force_retry_blocked bypasses cache → step retries and fails again (still DataError)" || fail "P6 force_retry_blocked bypass" "$FORCED_STATUS"
+
+# 5. Cache cleanup via teardown — only succeeded steps clear cache, so we
+#    test the path directly by inserting a clean field, then tearing it down,
+#    then verifying the cache entry for that op+payload is gone.
+R=$(mcp_call 100 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p6-td","is_demo":true,"api_domain":"memory://p6td","writable_org_ids":["memory://p6td"]}}' | text_of)
+P6_TD_CONN=$(echo "$R" | field_of connection_id)
+P6_TD_DELTA='{"spec_version":0,"fields":[{"api_name":"clean_field_for_cache_clear","label":"x","kind":"text","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+# Manually insert a fake permanent_failure for the clean field on this connection.
+PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -c "insert into permanent_failures (connection_id, operation, payload_hash, error_code, error_message, expires_at) select '$P6_TD_CONN', 'create_field', overlay->>'hash', 'DataError:FAKE_FOR_TEARDOWN_CLEAR', 'fake', extract(epoch from now())::integer + 86400 from (select 'create_field' as op, 'h12345678' as hash) ignored, lateral (select jsonb_build_object('hash','h12345678') as overlay) o;" >/dev/null 2>&1 || true
+# Now run plan + apply to create the field (without test prefix so it succeeds), then teardown.
+R=$(mcp_call 101 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P6_TD_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P6_TD_DELTA}}" | text_of)
+P6_TD_PLAN=$(echo "$R" | field_of plan_id)
+R=$(mcp_call 102 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P6_TD_PLAN\"}}" | text_of)
+P6_TD_RUN=$(echo "$R" | field_of run_id)
+# Now manually insert a permanent_failure ALSO matching the same payload_hash so teardown clears it.
+PAYLOAD_HASH=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -t -A -c "select payload_json from run_steps where run_id = '$P6_TD_RUN' and operation = 'create_field' limit 1;" | node -e "
+const fs=require('fs');
+const obj=JSON.parse(fs.readFileSync(0,'utf8').trim());
+// stableHash equivalent — same algo as src/core/overlay.ts
+function canon(v){if(v===null||typeof v!=='object')return v;if(Array.isArray(v))return v.map(canon);const o=v;const k=Object.keys(o).sort();const r={};for(const x of k)r[x]=canon(o[x]);return r}
+const json=JSON.stringify(canon(obj));
+let h=0;for(let i=0;i<json.length;i++)h=((h<<5)-h+json.charCodeAt(i))|0;
+process.stdout.write('h'+(h>>>0).toString(16).padStart(8,'0'));
+")
+PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -c "insert into permanent_failures (connection_id, operation, payload_hash, error_code, error_message, expires_at) values ('$P6_TD_CONN','create_field','$PAYLOAD_HASH','DataError:CACHED_BEFORE_TEARDOWN','simulated',extract(epoch from now())::integer + 86400);" >/dev/null
+BEFORE_CACHE=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -t -A -c "select count(*) from permanent_failures where connection_id='$P6_TD_CONN' and payload_hash='$PAYLOAD_HASH';")
+[ "$BEFORE_CACHE" = "1" ] && pass "P6: pre-teardown cache row exists for the to-be-reversed step" || fail "P6 cache row pre-teardown" "got count=$BEFORE_CACHE"
+# Now teardown the run — should clear the cache row matching that payload_hash.
+R=$(mcp_call 103 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$P6_TD_RUN\"}}" | text_of)
+CLEARED=$(echo "$R" | field_of cache_entries_cleared)
+[ "$CLEARED" -ge 1 ] && pass "P6: teardown_run reports cache_entries_cleared >= 1" || fail "P6 cache_entries_cleared" "got $CLEARED"
+AFTER_CACHE=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -t -A -c "select count(*) from permanent_failures where connection_id='$P6_TD_CONN' and payload_hash='$PAYLOAD_HASH';")
+[ "$AFTER_CACHE" = "0" ] && pass "P6: cache row is gone after teardown (next create attempt unblocked)" || fail "P6 cache row post-teardown" "got count=$AFTER_CACHE"
+
 # ---- 15. health ----
 echo "== /health =="
 H=$(curl -sS "$BASE/health")
