@@ -1,0 +1,102 @@
+# P13: cloud-side observation of the smoke gate.
+# The pre-commit hook runs this same smoke on the dev machine; this workflow makes
+# it observable to anyone else (PRs, force-pushes, anyone-but-the-author). Per
+# testing-philosophy AP#4 + AP#9: a deployed surface needs a smoke that runs
+# somewhere other than the author's laptop. SF_LIVE / ZOHO_LIVE gates stay local-
+# only (require OAuth secrets; introduce a flake surface). Default smoke = 79
+# assertions, covers the stub adapter + the typed-error + watchdog + permanent-cache
+# paths end-to-end.
+
+name: smoke
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+# A force-push or rapid second push cancels the earlier in-flight run for the same ref.
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: crm
+          POSTGRES_PASSWORD: crm
+          POSTGRES_DB: crm_provisioner
+        ports:
+          # Match the local dev host port (5433) so DATABASE_URL is identical here as locally.
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://crm:crm@127.0.0.1:5433/crm_provisioner
+      PORT: '8788'
+      # P14: a deterministic CI-only key. Encrypts NULL tokens on memory-adapter connections
+      # (the only path the default smoke exercises). NOT a real secret — the value is public
+      # because this file is in the repo; ANY real customer deployment uses a Railway-managed
+      # env var with a 32-byte random secret. Documented in docs/decision-log.md.
+      TOKEN_AT_REST_KEY: 'ci-smoke-key-not-a-real-secret-79-chars-of-deterministic-placeholder-12345678'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: install deps
+        run: npm ci
+
+      - name: apply migrations
+        run: npm run migrate
+
+      - name: start dev server (background)
+        run: |
+          # No SF_ALIAS / ZOHO_* envs — default smoke uses memory adapter only.
+          node --experimental-strip-types --no-warnings src/host/server.ts > /tmp/server.log 2>&1 &
+          echo $! > /tmp/server.pid
+
+      - name: wait for /health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8788/health >/dev/null 2>&1; then
+              echo "server up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server failed to come up; log follows:"
+          cat /tmp/server.log
+          exit 1
+
+      - name: run smoke
+        run: bash scripts/smoke-p0.sh
+
+      - name: upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log
+          path: /tmp/server.log
+          if-no-files-found: ignore
+
+      - name: stop server
+        if: always()
+        run: |
+          if [ -f /tmp/server.pid ]; then
+            kill $(cat /tmp/server.pid) 2>/dev/null || true
+          fi

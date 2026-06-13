@@ -11,7 +11,7 @@
     "dev": "tsx watch src/host/server.ts",
     "smoke": "bash scripts/smoke-p0.sh",
     "start": "node --experimental-strip-types src/host/server.ts",
-    "migrate": "psql \"$DATABASE_URL\" -f db/migrations/0001_initial.sql",
+    "migrate": "bash scripts/migrate.sh",
     "db:up": "docker compose up -d db",
     "db:down": "docker compose down"
   },
