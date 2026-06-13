@@ -38,6 +38,13 @@ const CAPS: CapabilityMap = {
   org_create: "manual",                    // Dev Hub scratch orgs is a P2.5 future
 };
 
+// P9: shared PermissionSet that grants Read+Edit on every provisioned custom field.
+// Surface doc: fields created via Tooling REST have NO field-level security — invisible
+// to all users via API until a PermSet grants it. Adapter pairs every create_field with
+// a single batched permset deploy + assignment, otherwise the apply lies about success
+// (the field exists in metadata but no SOQL can see it). Honors ai-output-handling AP#8.
+const PROVISIONER_PERMSET = "Prov_Provisioned";
+
 // --- HTTP helpers ----------------------------------------------------------
 
 type SfFetchInit = {
@@ -105,6 +112,9 @@ type Snapshot = {
   stages: Array<{ ApiName: string; IsActive: boolean; DefaultProbability: number }>;
   flows: Array<{ DeveloperName: string }>;
   assignment_rule_names: string[];
+  // P9: Field FullNames currently granted Read+Edit by PROVISIONER_PERMSET.
+  // Empty if the permset doesn't exist yet (first apply against a fresh org).
+  permset_field_perms: string[];
 };
 
 async function querySoql<T = Record<string, unknown>>(conn: ConnectionContext, soql: string): Promise<T[]> {
@@ -136,7 +146,18 @@ async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
     DeveloperName: r.DeveloperName,
   }));
 
-  return { fields_lead, stages: stageRows, flows, assignment_rule_names: [] };
+  // P9: which fields does PROVISIONER_PERMSET already grant Read+Edit on? Drives idempotent
+  // re-apply (plan emits noop for the visibility step when every spec field is already covered).
+  // FieldPermissions is a regular SOQL sObject — Tooling REST returns INVALID_TYPE here, so
+  // we go through /services/data/.../query (not /tooling/query). A non-existent permset
+  // returns 0 rows, not an error — empty array is the right baseline.
+  const permResp = await sf(conn, `/services/data/v62.0/query?q=${encodeURIComponent(
+    `SELECT Field FROM FieldPermissions WHERE Parent.Name = '${PROVISIONER_PERMSET}' AND PermissionsRead = true AND PermissionsEdit = true`,
+  )}`);
+  const permset_field_perms = (((permResp.body as { records?: Array<{ Field: string }> })?.records) ?? [])
+    .map((r) => r.Field);
+
+  return { fields_lead, stages: stageRows, flows, assignment_rule_names: [], permset_field_perms };
 }
 
 // --- Planning --------------------------------------------------------------
@@ -163,6 +184,27 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
       payload: f as FieldPayload,
       diff: exists ? "noop" : "create",
       destructive: false,
+    });
+  }
+
+  // P9: pair every create_field with FLS grant via PROVISIONER_PERMSET, emitted as a
+  // single batched step after all create_field steps. Diff is "noop" only when EVERY
+  // spec field already has Read+Edit perms in the permset — otherwise "create" (the
+  // metadata deploy reconciles to the union of existing + new). Destructive=false:
+  // permset deploy is additive; reversal happens via teardown removing field entries.
+  if (spec.fields.length) {
+    const fieldFullNames = spec.fields.map((f) =>
+      leadCustomFullName(f.module === "Leads" ? "Lead" : f.module, f.api_name),
+    );
+    const missing = fieldFullNames.filter((fn) => !snap.permset_field_perms.includes(fn));
+    steps.push({
+      seq: seq++,
+      operation: "grant_field_visibility",
+      target: PROVISIONER_PERMSET,
+      payload: { permset: PROVISIONER_PERMSET, fields: fieldFullNames },
+      diff: missing.length > 0 ? "create" : "noop",
+      destructive: false,
+      notes: `permset ${PROVISIONER_PERMSET}: ${fieldFullNames.length} field(s) total, ${missing.length} missing FLS grant — without this step, fields exist but no SOQL can see them`,
     });
   }
 
@@ -358,6 +400,140 @@ function inferAlias(_conn: ConnectionContext): string {
 
 function escapeXml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// PermissionSet deploy for FLS pairing (P9). Idempotent: every field becomes a
+// fieldPermissions entry with Read=Edit=true. SFDC's metadata deploy reconciles by
+// fullName, so deploying the union of {existing perms ∪ new perms} is the safe
+// pattern — partial deploys overwrite the permset's field list entirely.
+async function deployPermissionSet(conn: ConnectionContext, permsetName: string, fieldFullNames: string[]): Promise<void> {
+  if (!fieldFullNames.length) return;
+  const { spawn } = await import("node:child_process");
+  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  // Read the current FLS for this permset (if any) — the deploy fullName-replaces, so
+  // we must include EVERY field the permset currently grants plus the new ones.
+  // FieldPermissions lives in regular SOQL (not Tooling — Tooling returns INVALID_TYPE).
+  const existingResp = await sf(conn, `/services/data/v62.0/query?q=${encodeURIComponent(
+    `SELECT Field, PermissionsRead, PermissionsEdit FROM FieldPermissions WHERE Parent.Name = '${permsetName}'`,
+  )}`);
+  const existing = (((existingResp.body as { records?: Array<{ Field: string; PermissionsRead: boolean; PermissionsEdit: boolean }> })?.records) ?? []);
+  const merged = new Map<string, { read: boolean; edit: boolean }>();
+  for (const e of existing) merged.set(e.Field, { read: !!e.PermissionsRead, edit: !!e.PermissionsEdit });
+  for (const fn of fieldFullNames) merged.set(fn, { read: true, edit: true });
+
+  const fieldPermXml = Array.from(merged.entries()).map(([field, p]) => `  <fieldPermissions>
+    <editable>${p.edit}</editable>
+    <field>${escapeXml(field)}</field>
+    <readable>${p.read}</readable>
+  </fieldPermissions>`).join("\n");
+
+  const dir = await mkdtemp(join(tmpdir(), "sf-permset-"));
+  await mkdir(join(dir, "permissionsets"), { recursive: true });
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+  <hasActivationRequired>false</hasActivationRequired>
+  <label>${escapeXml(permsetName)}</label>
+${fieldPermXml}
+</PermissionSet>
+`;
+  await writeFile(join(dir, "permissionsets", `${permsetName}.permissionset-meta.xml`), xml);
+  await writeFile(join(dir, "package.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+  <types><members>${escapeXml(permsetName)}</members><name>PermissionSet</name></types>
+  <version>62.0</version>
+</Package>
+`);
+  // P9 debug: copy the deploy dir to /tmp so smoke can inspect what hit SFDC
+  if (process.env.SFDC_DEBUG_DEPLOY) {
+    await writeFile("/tmp/sf-permset-last-deploy.xml", xml);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const alias = inferAlias(conn);
+    const args = ["project", "deploy", "start", "--metadata-dir", dir, "--target-org", alias, "--wait", "10", "--json"];
+    const p = spawn("sf", args);
+    let stdout = ""; let stderr = "";
+    p.stdout.on("data", (b) => (stdout += b.toString()));
+    p.stderr.on("data", (b) => (stderr += b.toString()));
+    p.on("close", (code) => {
+      if (process.env.SFDC_DEBUG_DEPLOY) {
+        process.stderr.write(`[SFDC_DEBUG_DEPLOY] permset deploy exit=${code}\n[STDOUT]\n${stdout}\n[STDERR]\n${stderr}\n[XML]\n${xml}\n`);
+      }
+      code === 0 ? resolve() : reject(new Error(`sf permset deploy ${code}: ${stderr || stdout}`));
+    });
+  });
+}
+
+// P9 teardown helper: redeploy a permset with an EXACT field-perm list, replacing the
+// current contents wholesale (no merge). Used to remove field entries when reversing a
+// grant_field_visibility step. Same wire shape as deployPermissionSet but skips the
+// "fetch existing + union" pass.
+async function redeployPermissionSetExact(
+  conn: ConnectionContext,
+  permsetName: string,
+  perms: Array<{ field: string; read: boolean; edit: boolean }>,
+): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const fieldPermXml = perms.map((p) => `  <fieldPermissions>
+    <editable>${p.edit}</editable>
+    <field>${escapeXml(p.field)}</field>
+    <readable>${p.read}</readable>
+  </fieldPermissions>`).join("\n");
+
+  const dir = await mkdtemp(join(tmpdir(), "sf-permset-tdn-"));
+  await mkdir(join(dir, "permissionsets"), { recursive: true });
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+  <hasActivationRequired>false</hasActivationRequired>
+  <label>${escapeXml(permsetName)}</label>
+${fieldPermXml}
+</PermissionSet>
+`;
+  await writeFile(join(dir, "permissionsets", `${permsetName}.permissionset-meta.xml`), xml);
+  await writeFile(join(dir, "package.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+  <types><members>${escapeXml(permsetName)}</members><name>PermissionSet</name></types>
+  <version>62.0</version>
+</Package>
+`);
+
+  await new Promise<void>((resolve, reject) => {
+    const alias = inferAlias(conn);
+    const args = ["project", "deploy", "start", "--metadata-dir", dir, "--target-org", alias, "--wait", "10", "--json"];
+    const p = spawn("sf", args);
+    let stdout = ""; let stderr = "";
+    p.stdout.on("data", (b) => (stdout += b.toString()));
+    p.stderr.on("data", (b) => (stderr += b.toString()));
+    p.on("close", (code) => code === 0 ? resolve() : reject(new Error(`sf permset teardown deploy ${code}: ${stderr || stdout}`)));
+  });
+}
+
+// Assign PROVISIONER_PERMSET to the connection user (admin). Idempotent: SFDC returns
+// DUPLICATE_VALUE on already-assigned, which is treated as success.
+async function assignPermissionSet(conn: ConnectionContext, permsetName: string): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  const alias = inferAlias(conn);
+  await new Promise<void>((resolve, reject) => {
+    const p = spawn("sf", ["org", "assign", "permset", "--name", permsetName, "--target-org", alias, "--json"]);
+    let stdout = ""; let stderr = "";
+    p.stdout.on("data", (b) => (stdout += b.toString()));
+    p.stderr.on("data", (b) => (stderr += b.toString()));
+    p.on("close", (code) => {
+      const out = stdout + stderr;
+      if (code === 0) return resolve();
+      // sf returns non-zero on already-assigned in CLI 2.x — detect and treat as idempotent success.
+      // The actual stdout shape on duplicate: {"failures":[{"message":"Duplicate PermissionSetAssignment. ..."}]}.
+      if (/Duplicate PermissionSetAssignment|already(\s+has\s+assignment|\s+assigned)|DUPLICATE_VALUE/i.test(out)) return resolve();
+      reject(new Error(`sf assign permset ${code}: ${stderr || stdout}`));
+    });
+  });
 }
 
 // Flow deploy for the 3 workflow shapes — same metadata-deploy path via sf CLI.
@@ -571,6 +747,15 @@ export const salesforceAdapter: Adapter = {
           const res = await retryBoundary(() => createField(conn, step.payload as FieldPayload));
           const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
           results.push(r); onStep(r);
+        } else if (step.operation === "grant_field_visibility") {
+          // P9: deploy the shared PROVISIONER_PERMSET with Read+Edit on every spec field,
+          // then assign to the connection user (admin). Without this, create_field above
+          // landed bytes in metadata but no SOQL can see them — ai-output-handling AP#8.
+          const payload = step.payload as { permset: string; fields: string[] };
+          await retryBoundary(() => deployPermissionSet(conn, payload.permset, payload.fields));
+          await retryBoundary(() => assignPermissionSet(conn, payload.permset));
+          const r: StepResult = { seq: step.seq, status: "succeeded", result: { permset: payload.permset, fields_granted: payload.fields.length } };
+          results.push(r); onStep(r);
         } else if (step.operation.startsWith("create_workflow:")) {
           await retryBoundary(() => deployFlow(conn, step.payload as WorkflowPayload));
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { flow_deployed: true } };
@@ -610,6 +795,26 @@ export const salesforceAdapter: Adapter = {
           const module = f.module === "Leads" ? "Lead" : f.module;
           await deployDestructive(conn, "CustomField", `${module}.${f.api_name}__c`);
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "create_field", method: "destructiveChanges" } };
+          results.push(r); onStep(r);
+        } else if (step.operation === "grant_field_visibility") {
+          // P9 reversal: redeploy the permset MINUS this run's field entries. We keep the
+          // permset itself (other runs may grant other fields through it) and leave the
+          // admin's assignment intact (idempotent across runs). If the resulting permset
+          // would have zero field entries, the redeploy still succeeds — empty permset
+          // is valid SFDC metadata.
+          const payload = step.payload as { permset: string; fields: string[] };
+          const existingResp = await sf(conn, `/services/data/v62.0/query?q=${encodeURIComponent(
+            `SELECT Field, PermissionsRead, PermissionsEdit FROM FieldPermissions WHERE Parent.Name = '${payload.permset}'`,
+          )}`);
+          const existing = (((existingResp.body as { records?: Array<{ Field: string; PermissionsRead: boolean; PermissionsEdit: boolean }> })?.records) ?? []);
+          const removeSet = new Set(payload.fields);
+          const keep = existing.filter((e) => !removeSet.has(e.Field));
+          // Re-deploy with just the remaining fields (or empty if none). deployPermissionSet
+          // does a fresh read inside, but since we pass [] for new fields it will reconcile
+          // against current state — to actually REMOVE entries we have to bypass the helper
+          // and write the redacted XML directly.
+          await redeployPermissionSetExact(conn, payload.permset, keep.map((e) => ({ field: e.Field, read: !!e.PermissionsRead, edit: !!e.PermissionsEdit })));
+          const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "grant_field_visibility", fields_removed: payload.fields.length, fields_remaining: keep.length } };
           results.push(r); onStep(r);
         } else {
           // Stage deactivate-not-delete (the S0 catch) — we just record as reversed but the

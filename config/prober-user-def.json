@@ -1,0 +1,12 @@
+{
+  "Email": "prober@crm-provisioner.invalid",
+  "Username": "prober.smoke@crm-provisioner.invalid",
+  "LastName": "Prober",
+  "FirstName": "FLS",
+  "Alias": "prober",
+  "TimeZoneSidKey": "America/Los_Angeles",
+  "LocaleSidKey": "en_US",
+  "EmailEncodingKey": "UTF-8",
+  "ProfileName": "Standard User",
+  "LanguageLocaleKey": "en_US"
+}
