@@ -8,6 +8,17 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Source .dev.vars if present so locally-run smoke (pre-commit hook, manual runs) sees the
+# same env as the dev server it talks to. CI runs without this file; the workflow exports
+# env vars directly. Keep file-not-found silent — CI absence is the expected case.
+if [ -f .dev.vars ]; then
+  set -a; . ./.dev.vars; set +a
+fi
+# Default TOKEN_AT_REST_KEY so `set -u` doesn't bomb on P14 assertions when run with neither
+# .dev.vars present nor an explicit env (e.g. minimal CI without the secret). An empty key
+# would cause the decrypt assertion to fail meaningfully ("got ''"), not to crash here.
+: "${TOKEN_AT_REST_KEY:=}"
+
 PORT="${PORT:-8787}"
 BASE="http://127.0.0.1:$PORT"
 PASS=0; FAIL=0
@@ -538,6 +549,49 @@ R=$(mcp_call 134 'tools/call' '{"name":"connect_crm","arguments":{"crm":"zoho","
 P10_ZERR=$(echo "$R" | field_of error)
 [ "$P10_ZERR" = "CONFIG_ERROR" ] && pass "P10: zoho connect without api_domain refused with CONFIG_ERROR" || fail "P10 zoho api_domain enforcement" "got error='$P10_ZERR' (expected CONFIG_ERROR)"
 
+# ---- P14: token at-rest encryption ----
+
+echo "== P14: server refuses to boot without TOKEN_AT_REST_KEY (fail-at-boot, not fall-back) =="
+# Spawn the server with NO key set; expect non-zero exit + the instructive error on stderr.
+# env -i strips the shell's TOKEN_AT_REST_KEY; we pass through PATH/HOME/DATABASE_URL so
+# Node can find itself and connect to PG (but the key check happens before any DB call).
+# Different port so we don't fight the running dev server.
+DBURL="${DATABASE_URL:-postgres://crm:crm@127.0.0.1:5433/crm_provisioner}"
+BOOT_OUTPUT=$(env -i PATH="$PATH" HOME="$HOME" DATABASE_URL="$DBURL" PORT=8799 \
+  node --experimental-strip-types --no-warnings src/host/server.ts 2>&1 || true)
+echo "$BOOT_OUTPUT" | grep -q "TOKEN_AT_REST_KEY env var is required" \
+  && pass "P14: server boot fails loudly with instructive error when TOKEN_AT_REST_KEY is absent" \
+  || fail "P14 fail-at-boot" "expected 'TOKEN_AT_REST_KEY env var is required' on stderr; got: $(echo "$BOOT_OUTPUT" | tail -3)"
+
+echo "== P14: encrypted token round-trip via memory connection =="
+# The memory CONN created at smoke startup has NULL refresh_token (no auth needed for memory
+# adapter). The encrypted column should reflect NULL too — proves the case-when guards work.
+NULL_TOKEN_CT=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -tA -c \
+  "select coalesce(octet_length(refresh_token_encrypted)::text, 'null') from connections where id = '$CONN'")
+[ "$NULL_TOKEN_CT" = "null" ] && pass "P14: memory connection's NULL refresh_token stays NULL in encrypted column (no ciphertext-for-empty)" || fail "P14 null-token encryption" "got octet_length='$NULL_TOKEN_CT' (expected NULL)"
+
+# A connection WITH an access_token should produce ciphertext (length > 0). Use a separate
+# connect_crm with a synthetic access_token to verify encryption happens on insert.
+R=$(mcp_call 901 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p14-enc-test","is_demo":true,"api_domain":"memory://p14enc","writable_org_ids":["memory://p14enc"],"access_token":"synthetic-token-value-for-p14-smoke"}}' | text_of)
+P14_ENC_CONN=$(echo "$R" | field_of connection_id)
+ENC_LEN=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -tA -c \
+  "select octet_length(access_token_encrypted) from connections where id = '$P14_ENC_CONN'")
+[ -n "$ENC_LEN" ] && [ "$ENC_LEN" -gt 50 ] && pass "P14: access_token encrypted at rest (ciphertext ${ENC_LEN} bytes)" || fail "P14 ciphertext present" "expected octet_length > 50, got '$ENC_LEN'"
+
+# Read-back via loadConn round-trip: the adapter sees the plaintext token. psql -c does
+# NOT expand :variable references — use a heredoc; the base64 key has no shell-special
+# characters so $-interpolation inside single-quoted SQL is safe.
+PLAINTEXT=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -tA <<SQL
+select pgp_sym_decrypt(access_token_encrypted, '$TOKEN_AT_REST_KEY'::text)::text from connections where id = '$P14_ENC_CONN';
+SQL
+)
+[ "$PLAINTEXT" = "synthetic-token-value-for-p14-smoke" ] && pass "P14: pgp_sym_decrypt round-trips the original plaintext (loadConn contract)" || fail "P14 decrypt round-trip" "got '$PLAINTEXT'"
+
+# Defense-in-depth: confirm the OLD plaintext column is NULL (we no longer write to it).
+LEGACY=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -tA -c \
+  "select coalesce(access_token, 'null') from connections where id = '$P14_ENC_CONN'")
+[ "$LEGACY" = "null" ] && pass "P14: legacy plaintext access_token column is NULL (no double-write)" || fail "P14 plaintext column" "got '$LEGACY' (expected null)"
+
 # ---- 15. health ----
 echo "== /health =="
 H=$(curl -sS "$BASE/health")
@@ -556,6 +610,8 @@ if [ "${SF_LIVE:-0}" = "1" ]; then
   [ -n "$SF_TOKEN" ] && pass "got sf access token (len=${#SF_TOKEN})" || fail "got sf access token" "empty — run 'sf org login web' first"
 
   # Connection: declares writable_org_ids = exactly shane-dev's URL.
+  # P12: sf_alias passed explicitly per connection (vs the legacy SF_ALIAS env-global). The
+  # adapter's inferAlias() reads conn.sf_alias first; env stays as fallback for legacy rows.
   # Pass token via env to dodge any shell-escaping pitfalls.
   ARGS=$(SF_TOKEN="$SF_TOKEN" SF_URL="$SF_URL" node -e '
 const args = { name: "connect_crm", arguments: {
@@ -564,13 +620,16 @@ const args = { name: "connect_crm", arguments: {
   is_demo: true,
   api_domain: process.env.SF_URL,
   writable_org_ids: [process.env.SF_URL],
-  access_token: process.env.SF_TOKEN
+  access_token: process.env.SF_TOKEN,
+  sf_alias: "shane-dev"
 }};
 process.stdout.write(JSON.stringify(args));
 ')
   R=$(mcp_call 50 'tools/call' "$ARGS" | text_of)
   SF_CONN=$(echo "$R" | field_of connection_id)
+  SF_ALIAS_ECHO=$(echo "$R" | field_of sf_alias)
   [ -n "$SF_CONN" ] && pass "live SFDC connection created" || fail "live SFDC connection" "$R"
+  [ "$SF_ALIAS_ECHO" = "shane-dev" ] && pass "P12: connect_crm persists sf_alias=shane-dev on the connection" || fail "P12 sf_alias persisted" "got '$SF_ALIAS_ECHO'"
 
   # inspect — should pull real stage list
   R=$(mcp_call 51 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$SF_CONN\"}}" | text_of)
@@ -820,6 +879,31 @@ const d=JSON.parse(require('fs').readFileSync(0));
 process.stdout.write((d.workflow_rules||[]).some(r=>r.name==='prov_prov_idle_alert') ? 'yes' : 'no');
 ")
   [ "$WF_EXISTS" = "yes" ] && pass "live Zoho: workflow rule visible via independent REST query" || fail "Zoho workflow REST verify" "got $WF_EXISTS"
+
+  # P12: workflow_rule teardown ACTUALLY DELETEs the rule (audit finding #7). Previously
+  # the teardown branch fell through to a silent-noop "no-op or stub op" — apply ran clean
+  # but the rule stayed live in the org. Capture THIS run's specific workflow_rule_id from
+  # get_run, then verify that exact ID is absent after teardown. Name-match alone is too
+  # broad: pre-P12 runs left ~9 orphan 'prov_prov_idle_alert' rules in the trial org with
+  # different IDs (cleanup is a separate concern from the teardown contract).
+  R=$(mcp_call 690 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$WF_RUN\"}}" | text_of)
+  WF_ID_CREATED=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_workflow:idle_deal_alert');
+process.stdout.write(s?.result_json?.workflow_rule_id || '');
+")
+  [ -n "$WF_ID_CREATED" ] && pass "P12: workflow_rule_id captured from run ($WF_ID_CREATED)" || fail "P12 workflow id capture" "no workflow_rule_id in run_steps result_json"
+
+  R=$(mcp_call 691 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$WF_RUN\"}}" | text_of)
+  WF_TD_STATUS=$(echo "$R" | field_of status)
+  [ "$WF_TD_STATUS" = "succeeded" ] && pass "P12: workflow_rule teardown_run succeeded" || fail "P12 workflow teardown" "$R"
+
+  WF_THIS_GONE=$(curl -sS "$ZOHO_API_BASE/crm/v8/settings/automation/workflow_rules?module=Deals" -H "Authorization: Zoho-oauthtoken $AT" 2>/dev/null | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const target = process.argv[1];
+process.stdout.write((d.workflow_rules||[]).some(r=>r.id===target) ? 'still-there' : 'gone');
+" "$WF_ID_CREATED")
+  [ "$WF_THIS_GONE" = "gone" ] && pass "P12: this run's workflow_rule actually DELETEd after teardown (specific-id verify)" || fail "P12 workflow_rule DELETE" "id $WF_ID_CREATED is '$WF_THIS_GONE' — the silent-noop teardown bug from audit finding #7"
 
   # round_robin_assignment stays MANUAL — plan should still show 'unsupported' with a note
   RR_DELTA='{"spec_version":0,"fields":[],"stages":[],"pipelines":[],"workflows":[{"shape":"round_robin_assignment","api_name":"prov_rr","module":"Lead","pool":["a@x.com","b@x.com"]}]}'

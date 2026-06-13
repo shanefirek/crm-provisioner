@@ -41,11 +41,15 @@ A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (
 | Teardown_run reversal of a prior run's steps | ✅ tested both adapters (with honest residue notes) |
 | Pre-commit smoke gate (requires live dev server) | ✅ blocks bad commits |
 
-**Smoke at HEAD (post P9/P10/P11 hardening pass, 2026-06-13):**
-- Default (no live CRM env): **79/79** — includes P11's 2 standalone .mjs boundary tests (`scripts/test-classifiers.mjs`, `scripts/test-overlay.mjs`) invoked from the smoke + the P10/P11 memory-adapter rate_limit/rejected exercises
-- `SF_LIVE=1`: **92/92** (adds 13 SFDC end-to-end — was 9 pre-P9; +4 FLS-pairing assertions)
-- `ZOHO_LIVE=1`: **97/97** (adds Zoho end-to-end + 4 template viability checks)
-- `SF_LIVE=1 ZOHO_LIVE=1`: **110/110**
+**Smoke at HEAD (post P9–P14 ship-ready pass, 2026-06-13):**
+- Default (no live CRM env): **84/84** — includes 2 standalone .mjs boundary tests, memory-adapter rate_limit/rejected paths, P14 fail-at-boot + encryption round-trip
+- `SF_LIVE=1`: **98/98** (adds 14 SFDC end-to-end — sf_alias persistence + FLS pairing)
+- `ZOHO_LIVE=1`: **105/105** (adds Zoho end-to-end + 4 template viability checks + workflow_rule teardown DELETE)
+- `SF_LIVE=1 ZOHO_LIVE=1`: **119/119**
+
+**CI gate (P13):** `.github/workflows/smoke.yml` runs default smoke on every push + PR to `main` (Postgres 16 service, Node 22, ~60-90s cold). Cloud-side verification lands the first time the repo is pushed to GitHub.
+
+**P14 prerequisite for new dev environments:** `TOKEN_AT_REST_KEY` must be set in `.dev.vars` (32-byte base64 random) — the server refuses to start without it. Already set in this repo's .dev.vars (gitignored).
 
 ## What's NOT working / explicitly deferred
 

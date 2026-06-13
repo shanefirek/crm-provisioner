@@ -9,6 +9,21 @@ import { buildMcpServer } from "./mcp.ts";
 
 const PORT = Number(process.env.PORT ?? 8788);
 
+// P14: fail-at-boot if TOKEN_AT_REST_KEY is missing (configuration-philosophy tier-1).
+// Decrypting connection secrets requires the key; the server refuses to start without
+// one rather than silently downgrade to plaintext reads. Key is a short string sent
+// straight to pgcrypto's pgp_sym_encrypt / pgp_sym_decrypt — any non-empty value works
+// (strength scales with entropy; production must use a 32+ byte random secret stored
+// in Railway's secret manager or external KMS).
+if (!process.env.TOKEN_AT_REST_KEY || !process.env.TOKEN_AT_REST_KEY.trim()) {
+  console.error(
+    "FATAL: TOKEN_AT_REST_KEY env var is required (used to encrypt connections.refresh_token at rest).\n" +
+      "       For local dev: add to .dev.vars (gitignored). For production: set via Railway env vars.\n" +
+      "       See docs/decision-log.md for the KMS-wrap upgrade path.",
+  );
+  process.exit(1);
+}
+
 // One transport per session (per MCP Streamable HTTP semantics).
 // Lives for the process lifetime; a long-running Node process is exactly what we want for this.
 const transports = new Map<string, StreamableHTTPServerTransport>();
