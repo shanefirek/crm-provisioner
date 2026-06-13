@@ -2,6 +2,27 @@
 
 You've walked into this repo cold (or it's been a few days). This is the single doc that gets you back to full speed in ~5 minutes. Read in order; descend to specific docs only when their topic applies to your task.
 
+## 🟡 Open thread to settle before P8 (paused 2026-06-13, end of session)
+
+**The Zoho Deluge question.** Earlier we marked `round_robin_assignment` as `manual` because the standard implementation is a Deluge function and S0 probed `POST /crm/v8/settings/functions` once, got `REQUIRED_PARAM_MISSING: metadata`, and gave up. The harvest formalized that as `manual` with a documented one-time-paste script.
+
+**Shane's correction:** "Deluge is not UI-only — people use Deluge." This is correct. The Zoho partner ecosystem (Ashim's network) lives in Deluge; calling it manual undersells our app. We considered the webhook workaround (Zoho fires `/webhooks/zoho/{conn_id}/round-robin` at our server, server picks owner via REST) but Shane correctly pushed back: that's dodging Deluge, not handling it. If our pitch is "we configure Zoho via Claude," we have to ship Deluge programmatically the way partners do.
+
+**The 4 real paths to investigate, none of which we've actually probed yet:**
+1. `POST /crm/v8/settings/functions` with the *correct* body wrapper. The endpoint exists; S0's body was wrong. Worth real adversarial probing — same failure mode as the wrong workflow_rules path in S0 → P4.5 harvest correction.
+2. **Zoho Extension Toolkit (`zet`)** — the official CLI partners use to package Deluge as an extension. Open question: does it support **private single-customer deployment**, or only public Marketplace?
+3. **Zoho FX / Catalyst** — host Deluge functions on Zoho's serverless platform, called from customer CRM via workflow_rule webhook to our FX function. Mixed-vendor.
+4. **Inline Deluge in workflow_rule actions** — some action types might accept code inline rather than referencing an existing function ID. Haven't checked exhaustively.
+
+**Concrete next step proposed (NOT executed yet):** ~30 minutes of focused probing.
+- (a) Hit `POST /crm/v8/settings/functions` with multiple body shape variants (wrapper keys: `functions[]` vs `function`, `metadata.language: "deluge"`, `script` vs `code`, etc.) against the trial. If any returns 201, document it and we have a single-call solution.
+- (b) Read `zet` CLI docs for private deployment. If single-customer deploy is possible, plan the adapter shape.
+- Report: "here's the canonical programmatic-Deluge path, here's the working body shape, here's the v1 plan." Don't pick architecture until the probe answers it.
+
+**Don't scaffold P8 before this answer.** The architecture of P8 depends on which of the four paths is real.
+
+Reference: this conversation parked at "let's pause" after the spike was proposed. The api-ingest skill update from this session (claude-config commit `37a1a02`) explicitly addresses this failure mode: ⚠️/❌ verdicts are provisional until an adversarial cross-check confirms. The current `manual` verdict on round_robin_assignment violates that rule and is the reason we're stopping to revisit.
+
 ## What this repo is, in one paragraph
 
 A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (real-estate, professional-services, hvac-services, manufacturing — or toy-sales for smoke), authors a small **delta** over it, runs validate → plan → apply, and the deterministic driver pushes the resulting config into Salesforce or Zoho via a per-CRM adapter. Postgres on Railway holds connections + run history. The whole product surface is **8 MCP tools**; there is no UI in v1. Equity venture with Stefan (sourcing/review), Ashim (distribution), Varun (Deluge/product) — Shane sole builder.
