@@ -280,6 +280,92 @@ else
   echo "  (SF_LIVE=0 — live SFDC assertions skipped. Run 'SF_LIVE=1 bash scripts/smoke-p0.sh' to exercise.)"
 fi
 
+# ============================================================================
+# LIVE ZOHO SMOKE — gated on ZOHO_LIVE=1
+# ============================================================================
+# Requires .dev.vars at repo root with ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET /
+# ZOHO_REFRESH_TOKEN / ZOHO_DC / ZOHO_API_BASE. Touches the real Zoho trial org.
+if [ "${ZOHO_LIVE:-0}" = "1" ]; then
+  echo
+  echo "== LIVE: Zoho adapter end-to-end =="
+  # Source the .dev.vars without clobbering shell-critical names
+  if [ -f .dev.vars ]; then
+    set -a; . ./.dev.vars; set +a
+  fi
+  [ -n "${ZOHO_REFRESH_TOKEN:-}" ] && pass "ZOHO_REFRESH_TOKEN present in .dev.vars" || fail "ZOHO_REFRESH_TOKEN present" "missing"
+
+  ARGS=$(ZRT="$ZOHO_REFRESH_TOKEN" ZDC="${ZOHO_DC:-com}" ZAD="${ZOHO_API_BASE:-https://www.zohoapis.com}" node -e '
+const a = { name: "connect_crm", arguments: {
+  crm: "zoho",
+  org_label: "zoho trial (LIVE)",
+  is_demo: true,
+  api_domain: process.env.ZAD,
+  writable_org_ids: [process.env.ZAD],
+  refresh_token: process.env.ZRT,
+  dc: process.env.ZDC
+}};
+process.stdout.write(JSON.stringify(a));
+')
+  R=$(mcp_call 60 'tools/call' "$ARGS" | text_of)
+  Z_CONN=$(echo "$R" | field_of connection_id)
+  [ -n "$Z_CONN" ] && pass "live Zoho connection created" || fail "live Zoho connection" "$R"
+
+  # inspect
+  R=$(mcp_call 61 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$Z_CONN\"}}" | text_of)
+  Z_LEAD_FIELD_COUNT=$(echo "$R" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).snapshot?.fields_lead||[]).length))")
+  Z_STAGE_COUNT=$(echo "$R" | node -e "process.stdout.write(String((JSON.parse(require('fs').readFileSync(0)).snapshot?.stages||[]).length))")
+  [ "$Z_LEAD_FIELD_COUNT" -gt 5 ] && pass "live Zoho inspect: >5 Lead fields ($Z_LEAD_FIELD_COUNT)" || fail "Zoho inspect lead fields" "got $Z_LEAD_FIELD_COUNT"
+  [ "$Z_STAGE_COUNT" -ge 5 ] && pass "live Zoho inspect: >=5 stages ($Z_STAGE_COUNT)" || fail "Zoho inspect stages" "got $Z_STAGE_COUNT"
+
+  # plan + apply field-only delta
+  Z_DELTA='{"spec_version":0,"fields":[{"api_name":"prov_zoho_smoke","label":"Prov Zoho Smoke","kind":"text","module":"Leads","length":80,"description":"crm-provisioner P3 smoke — safe to delete"}],"stages":[],"pipelines":[],"workflows":[]}'
+  R=$(mcp_call 62 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$Z_DELTA}}" | text_of)
+  Z_PLAN=$(echo "$R" | field_of plan_id)
+  [ -n "$Z_PLAN" ] && pass "live Zoho plan returned plan_id" || fail "Zoho plan" "$R"
+
+  R=$(mcp_call 63 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$Z_PLAN\"}}" | text_of)
+  Z_RUN=$(echo "$R" | field_of run_id)
+  Z_STATUS=$(echo "$R" | field_of status)
+  [ "$Z_STATUS" = "succeeded" ] && pass "live Zoho apply succeeded" || fail "Zoho apply" "$R"
+
+  # verify
+  R=$(mcp_call 64 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$Z_CONN\"}}" | text_of)
+  FOUND=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+process.stdout.write((d.snapshot?.fields_lead||[]).find(x=>x.api_name==='prov_zoho_smoke') ? 'yes' : 'no');
+")
+  [ "$FOUND" = "yes" ] && pass "live Zoho: probe field exists" || fail "Zoho field exists" "got $FOUND"
+
+  # idempotent re-plan
+  R=$(mcp_call 65 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$Z_DELTA}}" | text_of)
+  Z_NOOP=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field' && x.payload?.api_name==='prov_zoho_smoke');
+process.stdout.write(s?.diff || 'missing');
+")
+  [ "$Z_NOOP" = "noop" ] && pass "live Zoho: idempotent re-plan = noop on field" || fail "Zoho idempotent" "got '$Z_NOOP'"
+
+  # teardown
+  R=$(mcp_call 66 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$Z_RUN\"}}" | text_of)
+  Z_TD_STATUS=$(echo "$R" | field_of status)
+  [ "$Z_TD_STATUS" = "succeeded" ] && pass "live Zoho teardown succeeded" || fail "Zoho teardown" "$R"
+
+  R=$(mcp_call 67 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$Z_CONN\"}}" | text_of)
+  GONE=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+process.stdout.write((d.snapshot?.fields_lead||[]).find(x=>x.api_name==='prov_zoho_smoke') ? 'still-there' : 'gone');
+")
+  [ "$GONE" = "gone" ] && pass "live Zoho: probe field removed by teardown" || fail "Zoho field removed" "got $GONE"
+
+  # Workflow shapes must surface as UNSUPPORTED (per the v0 capability map)
+  WF_DELTA='{"spec_version":0,"fields":[],"stages":[],"pipelines":[],"workflows":[{"shape":"idle_deal_alert","api_name":"prov_idle_alert","pipeline":"Standard","stage":"Qualified","idle_days":14,"notify":"owner"}]}'
+  R=$(mcp_call 68 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$WF_DELTA}}" | text_of)
+  UNSUP=$(echo "$R" | field_of unsupported_count)
+  [ "$UNSUP" = "1" ] && pass "live Zoho: workflow shape correctly marked UNSUPPORTED" || fail "Zoho unsupported surfacing" "unsupported_count=$UNSUP"
+else
+  echo "  (ZOHO_LIVE=0 — live Zoho assertions skipped. Run 'ZOHO_LIVE=1 bash scripts/smoke-p0.sh' to exercise.)"
+fi
+
 # ---- summary ----
 echo
 echo "== Summary =="

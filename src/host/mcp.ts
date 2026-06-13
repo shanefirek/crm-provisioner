@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { memoryAdapter } from "../adapters/memory.ts";
 import { salesforceAdapter } from "../adapters/salesforce.ts";
+import { zohoAdapter } from "../adapters/zoho.ts";
 import type { Adapter, ConnectionContext, Plan, RunStepRecord } from "../adapters/types.ts";
 import { applyOverlay } from "../core/overlay.ts";
 import { DeltaSpecSchema, ProvisionSpecSchema, type ProvisionSpec } from "../core/spec.ts";
@@ -15,6 +16,7 @@ const PLAN_CACHE = new Map<string, CachedPlan>();
 
 function adapterFor(crm: string): Adapter {
   if (crm === "salesforce") return salesforceAdapter;
+  if (crm === "zoho") return zohoAdapter;
   return memoryAdapter;
 }
 
@@ -23,7 +25,7 @@ const trace = () => crypto.randomUUID();
 
 async function loadConn(id: string): Promise<ConnectionContext | null> {
   const { rows } = await db.query(
-    `select id, crm, api_domain, is_demo, writable_org_ids, refresh_token, access_token, access_expires
+    `select id, crm, dc, api_domain, is_demo, writable_org_ids, refresh_token, access_token, access_expires
        from connections where id = $1`,
     [id],
   );
@@ -104,17 +106,18 @@ export function buildMcpServer(): McpServer {
           .describe("Allowlist of api_domain values this connection may write to. Empty array = allow any (demo only)."),
         api_domain: z.string().optional().describe("The CRM instance URL / API domain; checked against writable_org_ids on apply()"),
         access_token: z.string().optional().describe("P2 dev only — paste an existing token. P3 host work replaces with OAuth callback."),
-        refresh_token: z.string().optional(),
+        refresh_token: z.string().optional().describe("Zoho: required for the adapter to mint access tokens from the refresh_token grant."),
+        dc: z.string().optional().describe("Zoho only — datacenter ('com' | 'eu' | 'in' | 'com.au'). Determines accounts.zoho.{dc} host for OAuth refresh."),
       },
     },
-    async ({ crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token }) => {
+    async ({ crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token, dc }) => {
       const id = crypto.randomUUID();
       await db.query(
-        `insert into connections (id, crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token)
-           values ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [id, crm, org_label ?? `${crm} connection`, is_demo, writable_org_ids, api_domain ?? null, access_token ?? null, refresh_token ?? null],
+        `insert into connections (id, crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token, dc)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [id, crm, org_label ?? `${crm} connection`, is_demo, writable_org_ids, api_domain ?? null, access_token ?? null, refresh_token ?? null, dc ?? null],
       );
-      return ok(JSON.stringify({ connection_id: id, crm, is_demo, writable_org_ids, api_domain: api_domain ?? null }, null, 2));
+      return ok(JSON.stringify({ connection_id: id, crm, is_demo, writable_org_ids, api_domain: api_domain ?? null, dc: dc ?? null }, null, 2));
     },
   );
 

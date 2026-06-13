@@ -48,6 +48,7 @@ export type ConnectionContext = {
   id: string;
   crm: string;
   api_domain?: string;
+  dc?: string;                  // Zoho only: 'com' | 'eu' | 'in' | 'com.au'
   is_demo: boolean;
   writable_org_ids: string[];
   // Adapter-specific auth bits stay opaque to the driver.
