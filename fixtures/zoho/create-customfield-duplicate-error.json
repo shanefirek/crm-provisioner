@@ -1,0 +1,1 @@
+{"fields":[{"code":"DUPLICATE_DATA","details":{"api_name":"api_name","json_path":"$.fields[0].api_name"},"message":"API NAME DUPLICATE","status":"error"}]}

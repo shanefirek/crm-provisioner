@@ -1,0 +1,82 @@
+[
+  {
+    "display_value": "Qualification",
+    "sequence_number": 2,
+    "deal_category": "Open",
+    "reference_value": "Qualification",
+    "probability": 10,
+    "forecast_category": {
+      "name": "Pipeline",
+      "id": "7473109000000006787"
+    },
+    "actual_value": "Qualification",
+    "id": "7473109000000006801",
+    "forecast_type": "Open",
+    "record_category_value": {},
+    "type": "used"
+  },
+  {
+    "display_value": "Needs Analysis",
+    "sequence_number": 3,
+    "deal_category": "Open",
+    "reference_value": "Needs Analysis",
+    "probability": 20,
+    "forecast_category": {
+      "name": "Pipeline",
+      "id": "7473109000000006787"
+    },
+    "actual_value": "Needs Analysis",
+    "id": "7473109000000006803",
+    "forecast_type": "Open",
+    "record_category_value": {},
+    "type": "used"
+  },
+  {
+    "display_value": "Value Proposition",
+    "sequence_number": 4,
+    "deal_category": "Open",
+    "reference_value": "Value Proposition",
+    "probability": 40,
+    "forecast_category": {
+      "name": "Pipeline",
+      "id": "7473109000000006787"
+    },
+    "actual_value": "Value Proposition",
+    "id": "7473109000000006805",
+    "forecast_type": "Open",
+    "record_category_value": {},
+    "type": "used"
+  },
+  {
+    "display_value": "Identify Decision Makers",
+    "sequence_number": 5,
+    "deal_category": "Open",
+    "reference_value": "Identify Decision Makers",
+    "probability": 60,
+    "forecast_category": {
+      "name": "Pipeline",
+      "id": "7473109000000006787"
+    },
+    "actual_value": "Id. Decision Makers",
+    "id": "7473109000000006807",
+    "forecast_type": "Open",
+    "record_category_value": {},
+    "type": "used"
+  },
+  {
+    "display_value": "Proposal/Price Quote",
+    "sequence_number": 6,
+    "deal_category": "Open",
+    "reference_value": "Proposal/Price Quote",
+    "probability": 75,
+    "forecast_category": {
+      "name": "Pipeline",
+      "id": "7473109000000006787"
+    },
+    "actual_value": "Proposal/Price Quote",
+    "id": "7473109000000006811",
+    "forecast_type": "Open",
+    "record_category_value": {},
+    "type": "used"
+  }
+]

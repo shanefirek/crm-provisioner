@@ -1,0 +1,16 @@
+{
+  "display_value": "Qualification",
+  "sequence_number": 2,
+  "deal_category": "Open",
+  "reference_value": "Qualification",
+  "probability": 10,
+  "forecast_category": {
+    "name": "Pipeline",
+    "id": "7473109000000006787"
+  },
+  "actual_value": "Qualification",
+  "id": "7473109000000006801",
+  "forecast_type": "Open",
+  "record_category_value": {},
+  "type": "used"
+}
