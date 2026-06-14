@@ -10,7 +10,7 @@
     "doc": "docs"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --experimental-strip-types --no-warnings scripts/test-classifiers.mjs && node --experimental-strip-types --no-warnings scripts/test-overlay.mjs && node --experimental-strip-types --no-warnings scripts/test-retry-after.mjs",
     "dev": "tsx watch src/host/server.ts",
     "smoke": "bash scripts/smoke-p0.sh",
     "start": "node --experimental-strip-types src/host/server.ts",
@@ -28,12 +28,14 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "pg": "^8.21.0",
+    "pino": "^10.3.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.9.3",
     "@types/pg": "^8.20.0",
+    "pino-pretty": "^13.1.3",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }

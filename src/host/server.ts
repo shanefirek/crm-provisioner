@@ -5,6 +5,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import "dotenv/config";
 import express from "express";
 import { db, ensureUp } from "./db.ts";
+import { log } from "./logger.ts";
 import { buildMcpServer } from "./mcp.ts";
 
 const PORT = Number(process.env.PORT ?? 8788);
@@ -20,19 +21,19 @@ const PORT = Number(process.env.PORT ?? 8788);
 //      — runs lazily after server.listen so DB is available; exits 1 on failure.
 const k = process.env.TOKEN_AT_REST_KEY;
 if (!k || !k.trim()) {
-  console.error(
-    "FATAL: TOKEN_AT_REST_KEY env var is required (used to encrypt connections.refresh_token at rest).\n" +
-      "       For local dev: add to .dev.vars (gitignored). For production: set via Railway env vars.\n" +
-      "       See docs/decision-log.md for the KMS-wrap upgrade path.",
+  log.fatal(
+    "TOKEN_AT_REST_KEY env var is required (used to encrypt connections.refresh_token at rest). " +
+      "For local dev: add to .dev.vars (gitignored). For production: set via Railway env vars. " +
+      "See docs/decision-log.md for the KMS-wrap upgrade path.",
   );
   process.exit(1);
 }
 if (k.length < 32) {
-  console.error(`FATAL: TOKEN_AT_REST_KEY is too short (${k.length} chars; minimum 32). Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`);
+  log.fatal({ chars: k.length, minimum: 32 }, `TOKEN_AT_REST_KEY is too short. Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`);
   process.exit(1);
 }
 if (!/^[A-Za-z0-9+/=]+$/.test(k)) {
-  console.error("FATAL: TOKEN_AT_REST_KEY contains non-base64 characters. Strict base64 (A-Z, a-z, 0-9, +, /, =) is required for safe shell/SQL interpolation. Generate a fresh one with: node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\"");
+  log.fatal("TOKEN_AT_REST_KEY contains non-base64 characters. Strict base64 (A-Z, a-z, 0-9, +, /, =) is required for safe shell/SQL interpolation. Regenerate with: node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\"");
   process.exit(1);
 }
 
@@ -103,8 +104,7 @@ app.get("/mcp", reuseTransport);
 app.delete("/mcp", reuseTransport);
 
 app.listen(PORT, async () => {
-  // eslint-disable-next-line no-console
-  console.log(`crm-provisioner listening on :${PORT}`);
+  log.info({ port: PORT }, "crm-provisioner listening");
 
   // P17 fix #3: pgcrypto round-trip self-test. Encrypts a known marker with the
   // env key, decrypts it, asserts equality. Catches malformed key, missing pgcrypto
@@ -119,16 +119,13 @@ app.listen(PORT, async () => {
     if (r.rows[0]?.roundtrip !== "boot-self-test") {
       throw new Error(`pgcrypto round-trip mismatch: got '${r.rows[0]?.roundtrip}'`);
     }
-    // eslint-disable-next-line no-console
-    console.log("✓ pgcrypto round-trip self-test passed (TOKEN_AT_REST_KEY usable)");
+    // Smoke greps for this exact string in /tmp/server.log / /tmp/server-p17.log —
+    // structured logger emits it as a JSON message field; the substring match still works.
+    log.info("pgcrypto round-trip self-test passed (TOKEN_AT_REST_KEY usable)");
   } catch (e) {
-    console.error(
-      "FATAL: pgcrypto round-trip self-test failed at boot. Likely causes:\n" +
-        "  - TOKEN_AT_REST_KEY is malformed (despite passing format checks)\n" +
-        "  - pgcrypto extension is missing in this database\n" +
-        "  - DB connection is broken\n" +
-        `Error: ${String(e)}`,
-    );
+    log.fatal({ err: String(e) },
+      "pgcrypto round-trip self-test failed at boot. Likely causes: " +
+        "TOKEN_AT_REST_KEY malformed (despite passing format checks); pgcrypto extension missing in DB; DB connection broken.");
     process.exit(1);
   }
 });

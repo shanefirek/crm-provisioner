@@ -1,9 +1,6 @@
 node_modules/
-.wrangler/
 .dev.vars
 .env
 *.log
 fixtures/**/tokens*
 fixtures/**/auth*
-worker-configuration.d.ts
-

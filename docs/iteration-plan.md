@@ -277,6 +277,28 @@ Two SFDC-specific review findings. Both close real holes without scope expansion
   - Removal of the legacy `process.env.SF_ALIAS_WARN_LEGACY` env knob — it's already dead code post-#1 but its removal is a nit; will fall out of the next sweep.
 - **Principles honored:** configuration-philosophy tier-2 (sf_alias is per-connection tenant config, not per-process env); modular-monorepo-shape (the 5 copy-pasted deploy helpers were a smell; the shared helper is the right altitude); error-handling-philosophy (the leaked tmpdirs were a per-apply resource leak — `try/finally rm` is the canonical pattern).
 
+## P19 — Housekeeping (post-fresh-eyes review)
+
+Stepping-back review identified normal MVP-stage drift (stub dirs left over from P0's first scaffold, stale .gitignore entries from the Cloudflare era, placeholder `npm test` script, ad-hoc console logging). None are structural problems, but cleaning them moves the repo from "MVP-stage" to "I'd be comfortable showing this in a developer interview."
+
+- **Deliverables:**
+  1. Delete empty stub directories at root: `adapters/`, `mcp/`, `spec/`, `templates/` (all 0 files, leftover from P0's first scaffold before code moved to `src/`).
+  2. Delete `ZET-debug.log` from the working tree (got dumped during the P8 Deluge spike).
+  3. Clean stale `.gitignore` entries: drop `.wrangler/` and `worker-configuration.d.ts` (Cloudflare residue).
+  4. Replace `npm test` placeholder with an invocation of the three standalone `.mjs` boundary scripts (`test-classifiers.mjs`, `test-overlay.mjs`, `test-retry-after.mjs`). `npm test` now does something real.
+  5. Add `pino` structured logger at `src/host/logger.ts` — pretty-print in dev, JSON in prod (Railway reads JSON well). Replace `console.log` / `console.error` in `src/host/server.ts` and `src/host/mcp.ts`. Boot logs (TOKEN_AT_REST_KEY validation, pgcrypto self-test, server listening) emit through the logger so they're correlatable with later request logs.
+- **Gate:**
+  - Default smoke 86/86 holds.
+  - Live Railway boot log shows JSON-formatted lines (vs prior plaintext).
+  - Production URL `/health` still returns 200.
+  - `npm test` invoked from a clean shell runs the 3 standalone scripts and exits 0.
+- **Defer:**
+  - Adding pino-pretty as a runtime dep (transport for dev only — install as devDep + conditional require).
+  - A `tsc` build step replacing `--experimental-strip-types` for prod (still flagged experimental, but works; conventional move is `tsc → dist/`).
+  - Vitest migration of the 3 `.mjs` scripts (more work than this phase warrants; rule of three is met but the current scripts are tight enough that the wrap-in-vitest cost outweighs the benefit for v1).
+  - Pool config (`max`, `idleTimeoutMillis`) on `src/host/db.ts` — Railway's free-tier limits handle current load; promote when load matters.
+- **Principles honored:** build-iteration-discipline (cleanup IS phased work, not residue); error-handling-philosophy (structured logging makes the trace-id-already-in-DB actually useful in incident response); testing-philosophy AP#5 (manual gate creep → scripted gate — `npm test` is now a real command).
+
 ## Iteration log
 
 *(append per phase: gate observation, 3-4 bullet retro, principle contradictions → update gtm-agent principle doc before next phase)*
