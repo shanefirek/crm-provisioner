@@ -48,7 +48,10 @@ jobs:
       # (the only path the default smoke exercises). NOT a real secret — the value is public
       # because this file is in the repo; ANY real customer deployment uses a Railway-managed
       # env var with a 32-byte random secret. Documented in docs/decision-log.md.
-      TOKEN_AT_REST_KEY: 'ci-smoke-key-not-a-real-secret-79-chars-of-deterministic-placeholder-12345678'
+      # P17 charset enforcement requires strict base64 ([A-Za-z0-9+/=]+); the prior placeholder
+      # used hyphens and broke its own CI when P17 shipped. Below is a deterministic 32-byte
+      # value, base64-encoded — fixed string, no real entropy, but valid for the boot check.
+      TOKEN_AT_REST_KEY: 'Q0lzbW9rZS1ub3QtYS1yZWFsLXNlY3JldC0zMmJ5dGUtcGxhY2Vob2xkZXI='
 
     steps:
       - uses: actions/checkout@v4
