@@ -41,12 +41,12 @@ A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (
 | Teardown_run reversal of a prior run's steps | ✅ tested both adapters (with honest residue notes) |
 | Pre-commit smoke gate (requires live dev server) | ✅ blocks bad commits |
 
-**Smoke at HEAD (post P9–P16 ship-ready pass, 2026-06-13):**
-- Default (no live CRM env): **86/86** — adds P15 advisory-lock serialization + dedup-first ordering assertions
-- `SF_LIVE=1`: **100/100**
+**Smoke at HEAD (post P9–P18, 2026-06-13):**
+- Default (no live CRM env): **89/89** — adds P17 short-key/non-base64 rejects + pgcrypto boot self-test
+- `SF_LIVE=1`: **102/102** — adds P18 sf_alias-required check + tmpdir-cleanup proof
 - `ZOHO_LIVE=1`: **107/107**
-- `SF_LIVE=1 ZOHO_LIVE=1`: **121/121**
-- **Remote against Railway** (`BASE=https://crm-provisioner-production.up.railway.app`): **78/78** (skips localhost-only PG/subprocess assertions — see P15 advisory-lock + P14 + P6 cache-row skips)
+- `SF_LIVE=1 ZOHO_LIVE=1`: **126/126**
+- **Remote against Railway**: ~76/76 (localhost-only PG/subprocess assertions skip per IS_LOCAL gating)
 
 **CI gate (P13):** `.github/workflows/smoke.yml` runs default smoke on every push + PR to `main` (Postgres 16 service, Node 22, ~40s cold). First green run observed 2026-06-13.
 

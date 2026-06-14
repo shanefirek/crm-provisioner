@@ -346,16 +346,6 @@ async function retrieveStandardValueSet(conn: ConnectionContext): Promise<{ valu
 }
 
 async function deployStandardValueSetXml(conn: ConnectionContext, values: SvsValue[]): Promise<void> {
-  // Metadata API deploy requires a multipart zip. To keep the adapter dependency-light, we
-  // delegate to the local `sf` CLI which the user already has authenticated. The adapter shells
-  // out via Node's child_process when the SFDC writer needs the Metadata API specifically.
-  const { spawn } = await import("node:child_process");
-  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-
-  const dir = await mkdtemp(join(tmpdir(), "sf-svs-"));
-  await mkdir(join(dir, "standardValueSets"), { recursive: true });
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <StandardValueSet xmlns="http://soap.sforce.com/2006/04/metadata">
   <sorted>false</sorted>
@@ -370,40 +360,75 @@ ${values.map((v) => `  <standardValue>
   </standardValue>`).join("\n")}
 </StandardValueSet>
 `;
-  await writeFile(join(dir, "standardValueSets", "OpportunityStage.standardValueSet-meta.xml"), xml);
   const pkg = `<?xml version="1.0" encoding="UTF-8"?>
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
   <types><members>OpportunityStage</members><name>StandardValueSet</name></types>
   <version>62.0</version>
 </Package>
 `;
-  await writeFile(join(dir, "package.xml"), pkg);
+  await deployMetadata(conn, {
+    "standardValueSets/OpportunityStage.standardValueSet-meta.xml": xml,
+  }, pkg, "svs");
+}
 
-  await new Promise<void>((resolve, reject) => {
-    const alias = inferAlias(conn);
-    const args = ["project", "deploy", "start", "--metadata-dir", dir, "--target-org", alias, "--wait", "10", "--json"];
-    const p = spawn("sf", args);
-    let stdout = ""; let stderr = "";
-    p.stdout.on("data", (b) => (stdout += b.toString()));
-    p.stderr.on("data", (b) => (stderr += b.toString()));
-    p.on("close", (code) => {
-      if (code === 0) return resolve();
-      reject(new Error(`sf deploy failed (${code}): ${stderr || stdout}`));
+// P18 fix #2: shared metadata-deploy helper. Pre-P18 five callers (deployStandardValueSetXml,
+// deployPermissionSet, redeployPermissionSetExact, deployFlow, deployDestructive) all open-
+// coded the same recipe — mkdtemp → write package.xml + a metadata file → spawn
+// `sf project deploy start --metadata-dir` — and none cleaned up the tmpdir. The review caught
+// a real per-apply leak (3+ dirs per FLS+flow+destructive cycle). Centralized here with
+// try/finally rm so the leak is closed for every caller at once.
+//
+// files: map of relative-path-within-deploy-dir → file contents (the XML strings).
+// packageXml: the package.xml body (typically declares the metadata members).
+// SFDC_DEBUG_DEPLOY=1 dumps the XML + exit code + stdout/stderr to stderr for post-mortem.
+async function deployMetadata(
+  conn: ConnectionContext,
+  files: Record<string, string>,
+  packageXml: string,
+  opName = "deploy",
+): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  const { mkdtemp, writeFile, mkdir, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join, dirname } = await import("node:path");
+
+  const dir = await mkdtemp(join(tmpdir(), `sf-${opName}-`));
+  try {
+    for (const [rel, contents] of Object.entries(files)) {
+      await mkdir(join(dir, dirname(rel)), { recursive: true });
+      await writeFile(join(dir, rel), contents);
+    }
+    await writeFile(join(dir, "package.xml"), packageXml);
+
+    await new Promise<void>((resolve, reject) => {
+      const alias = inferAlias(conn);
+      const args = ["project", "deploy", "start", "--metadata-dir", dir, "--target-org", alias, "--wait", "10", "--json"];
+      const p = spawn("sf", args);
+      let stdout = ""; let stderr = "";
+      p.stdout.on("data", (b) => (stdout += b.toString()));
+      p.stderr.on("data", (b) => (stderr += b.toString()));
+      p.on("close", (code) => {
+        if (process.env.SFDC_DEBUG_DEPLOY) {
+          process.stderr.write(`[SFDC_DEBUG_DEPLOY:${opName}] exit=${code}\n[STDOUT]\n${stdout}\n[STDERR]\n${stderr}\n[FILES]\n${Object.keys(files).join(", ")}\n`);
+        }
+        code === 0 ? resolve() : reject(new Error(`sf ${opName} deploy ${code}: ${stderr || stdout}`));
+      });
     });
-  });
+  } finally {
+    // try/finally tmpdir cleanup. Pre-P18 the 5 deploy* callers leaked these.
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 function inferAlias(conn: ConnectionContext): string {
-  // P12: per-connection alias takes precedence over the process-global env var.
-  // Multi-tenancy-isolation: two concurrent applies on different connections route
-  // to their own CLI aliases. Env-var fallback stays for the one-builder demo path
-  // where pre-P12 connections were created without sf_alias. P3 replaces all of
-  // this with OAuth-acquired connection identity + direct Bearer fetch.
-  if (conn.sf_alias) return conn.sf_alias;
-  if (process.env.SF_ALIAS_WARN_LEGACY === "1") {
-    process.stderr.write(`[sf-adapter] WARN: falling back to SF_ALIAS env for connection ${conn.id} — set sf_alias on the connection.\n`);
+  // P18 fix #1: per-connection alias required. connect_crm refuses SFDC connections
+  // without sf_alias (CONFIG_ERROR), so reaching here without one is a programming
+  // error or an out-of-band insert. Loud failure beats silent multi-tenancy violation.
+  // P3 replaces the CLI shell-out path entirely with OAuth + direct Bearer fetch.
+  if (!conn.sf_alias) {
+    throw new Error(`salesforce adapter: connection ${conn.id} has no sf_alias — refusing to default to env or "shane-dev" (multi-tenancy violation). Re-create the connection via connect_crm with sf_alias set.`);
   }
-  return process.env.SF_ALIAS || "shane-dev";
+  return conn.sf_alias;
 }
 
 function escapeXml(s: string): string {
@@ -416,11 +441,6 @@ function escapeXml(s: string): string {
 // pattern — partial deploys overwrite the permset's field list entirely.
 async function deployPermissionSet(conn: ConnectionContext, permsetName: string, fieldFullNames: string[]): Promise<void> {
   if (!fieldFullNames.length) return;
-  const { spawn } = await import("node:child_process");
-  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-
   // Read the current FLS for this permset (if any) — the deploy fullName-replaces, so
   // we must include EVERY field the permset currently grants plus the new ones.
   // FieldPermissions lives in regular SOQL (not Tooling — Tooling returns INVALID_TYPE).
@@ -438,8 +458,6 @@ async function deployPermissionSet(conn: ConnectionContext, permsetName: string,
     <readable>${p.read}</readable>
   </fieldPermissions>`).join("\n");
 
-  const dir = await mkdtemp(join(tmpdir(), "sf-permset-"));
-  await mkdir(join(dir, "permissionsets"), { recursive: true });
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
   <hasActivationRequired>false</hasActivationRequired>
@@ -447,32 +465,15 @@ async function deployPermissionSet(conn: ConnectionContext, permsetName: string,
 ${fieldPermXml}
 </PermissionSet>
 `;
-  await writeFile(join(dir, "permissionsets", `${permsetName}.permissionset-meta.xml`), xml);
-  await writeFile(join(dir, "package.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+  const pkg = `<?xml version="1.0" encoding="UTF-8"?>
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
   <types><members>${escapeXml(permsetName)}</members><name>PermissionSet</name></types>
   <version>62.0</version>
 </Package>
-`);
-  // P9 debug: copy the deploy dir to /tmp so smoke can inspect what hit SFDC
-  if (process.env.SFDC_DEBUG_DEPLOY) {
-    await writeFile("/tmp/sf-permset-last-deploy.xml", xml);
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const alias = inferAlias(conn);
-    const args = ["project", "deploy", "start", "--metadata-dir", dir, "--target-org", alias, "--wait", "10", "--json"];
-    const p = spawn("sf", args);
-    let stdout = ""; let stderr = "";
-    p.stdout.on("data", (b) => (stdout += b.toString()));
-    p.stderr.on("data", (b) => (stderr += b.toString()));
-    p.on("close", (code) => {
-      if (process.env.SFDC_DEBUG_DEPLOY) {
-        process.stderr.write(`[SFDC_DEBUG_DEPLOY] permset deploy exit=${code}\n[STDOUT]\n${stdout}\n[STDERR]\n${stderr}\n[XML]\n${xml}\n`);
-      }
-      code === 0 ? resolve() : reject(new Error(`sf permset deploy ${code}: ${stderr || stdout}`));
-    });
-  });
+`;
+  await deployMetadata(conn, {
+    [`permissionsets/${permsetName}.permissionset-meta.xml`]: xml,
+  }, pkg, "permset");
 }
 
 // P9 teardown helper: redeploy a permset with an EXACT field-perm list, replacing the
@@ -484,19 +485,12 @@ async function redeployPermissionSetExact(
   permsetName: string,
   perms: Array<{ field: string; read: boolean; edit: boolean }>,
 ): Promise<void> {
-  const { spawn } = await import("node:child_process");
-  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-
   const fieldPermXml = perms.map((p) => `  <fieldPermissions>
     <editable>${p.edit}</editable>
     <field>${escapeXml(p.field)}</field>
     <readable>${p.read}</readable>
   </fieldPermissions>`).join("\n");
 
-  const dir = await mkdtemp(join(tmpdir(), "sf-permset-tdn-"));
-  await mkdir(join(dir, "permissionsets"), { recursive: true });
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
   <hasActivationRequired>false</hasActivationRequired>
@@ -504,23 +498,15 @@ async function redeployPermissionSetExact(
 ${fieldPermXml}
 </PermissionSet>
 `;
-  await writeFile(join(dir, "permissionsets", `${permsetName}.permissionset-meta.xml`), xml);
-  await writeFile(join(dir, "package.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+  const pkg = `<?xml version="1.0" encoding="UTF-8"?>
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
   <types><members>${escapeXml(permsetName)}</members><name>PermissionSet</name></types>
   <version>62.0</version>
 </Package>
-`);
-
-  await new Promise<void>((resolve, reject) => {
-    const alias = inferAlias(conn);
-    const args = ["project", "deploy", "start", "--metadata-dir", dir, "--target-org", alias, "--wait", "10", "--json"];
-    const p = spawn("sf", args);
-    let stdout = ""; let stderr = "";
-    p.stdout.on("data", (b) => (stdout += b.toString()));
-    p.stderr.on("data", (b) => (stderr += b.toString()));
-    p.on("close", (code) => code === 0 ? resolve() : reject(new Error(`sf permset teardown deploy ${code}: ${stderr || stdout}`)));
-  });
+`;
+  await deployMetadata(conn, {
+    [`permissionsets/${permsetName}.permissionset-meta.xml`]: xml,
+  }, pkg, "permset-tdn");
 }
 
 // Assign PROVISIONER_PERMSET to the connection user (admin). Idempotent: SFDC returns
@@ -546,68 +532,39 @@ async function assignPermissionSet(conn: ConnectionContext, permsetName: string)
 
 // Flow deploy for the 3 workflow shapes — same metadata-deploy path via sf CLI.
 async function deployFlow(conn: ConnectionContext, w: WorkflowPayload): Promise<void> {
-  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-  const { spawn } = await import("node:child_process");
-
   const flowName = `prov_${w.api_name}`;
   const xml = flowXmlFor(flowName, w);
-
-  const dir = await mkdtemp(join(tmpdir(), "sf-flow-"));
-  await mkdir(join(dir, "flows"), { recursive: true });
-  await writeFile(join(dir, "flows", `${flowName}.flow-meta.xml`), xml);
-  await writeFile(join(dir, "package.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+  const pkg = `<?xml version="1.0" encoding="UTF-8"?>
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
   <types><members>${flowName}</members><name>Flow</name></types>
   <version>62.0</version>
 </Package>
-`);
-
-  await new Promise<void>((resolve, reject) => {
-    const alias = inferAlias(conn);
-    const args = ["project", "deploy", "start", "--metadata-dir", dir, "--target-org", alias, "--wait", "10", "--json"];
-    const p = spawn("sf", args);
-    let stdout = ""; let stderr = "";
-    p.stdout.on("data", (b) => (stdout += b.toString()));
-    p.stderr.on("data", (b) => (stderr += b.toString()));
-    p.on("close", (code) => code === 0 ? resolve() : reject(new Error(`sf flow deploy ${code}: ${stderr || stdout}`)));
-  });
+`;
+  await deployMetadata(conn, {
+    [`flows/${flowName}.flow-meta.xml`]: xml,
+  }, pkg, "flow");
 }
 
 // Destructive deploy — the canonical SFDC metadata removal path.
 // Writes a destructiveChanges.xml + empty package.xml, deploys via sf CLI.
 async function deployDestructive(conn: ConnectionContext, metadataType: string, memberFullName: string): Promise<void> {
-  const { spawn } = await import("node:child_process");
-  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-
-  const dir = await mkdtemp(join(tmpdir(), "sf-destroy-"));
-  await writeFile(join(dir, "destructiveChanges.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+  // Destructive deploys use destructiveChanges.xml + an empty package.xml — different
+  // file layout than the additive deploys above. deployMetadata accepts arbitrary file
+  // maps so this still fits the shared helper.
+  const destructiveChanges = `<?xml version="1.0" encoding="UTF-8"?>
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
   <types><members>${escapeXml(memberFullName)}</members><name>${escapeXml(metadataType)}</name></types>
   <version>62.0</version>
 </Package>
-`);
-  // package.xml MUST exist (even empty) — sf deploy refuses without it.
-  await writeFile(join(dir, "package.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+`;
+  const emptyPkg = `<?xml version="1.0" encoding="UTF-8"?>
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
   <version>62.0</version>
 </Package>
-`);
-  await new Promise<void>((resolve, reject) => {
-    const alias = inferAlias(conn);
-    const args = ["project", "deploy", "start", "--metadata-dir", dir, "--target-org", alias, "--wait", "10", "--json"];
-    const p = spawn("sf", args);
-    let out = ""; let err = "";
-    p.stdout.on("data", (b) => (out += b.toString()));
-    p.stderr.on("data", (b) => (err += b.toString()));
-    p.on("close", (code) => {
-      if (code === 0) return resolve();
-      reject(new Error(`sf destructive deploy ${code}: ${err || out}`));
-    });
-  });
+`;
+  await deployMetadata(conn, {
+    "destructiveChanges.xml": destructiveChanges,
+  }, emptyPkg, "destructive");
 }
 
 function flowXmlFor(flowName: string, w: WorkflowPayload): string {
