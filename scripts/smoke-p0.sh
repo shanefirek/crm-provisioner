@@ -675,10 +675,13 @@ if [ "$IS_LOCAL" = "1" ]; then
 
   echo "== P17: pgcrypto round-trip self-test fires at boot =="
   # P17 fix #3 (sub-test 3): the server logs the self-test pass on stdout after listening.
-  # The currently-running server already did this; grep its log.
-  grep -q "pgcrypto round-trip self-test passed" /tmp/server-p17.log 2>/dev/null \
-    && pass "P17: pgcrypto round-trip self-test ran + passed at boot" \
-    || fail "P17 pgcrypto self-test" "no 'self-test passed' message in /tmp/server-p17.log"
+  # Local dev typically writes to /tmp/server-p17.log; CI workflow writes to /tmp/server.log;
+  # check both paths so the assertion is invariant to where the operator pointed stdout.
+  if grep -q "pgcrypto round-trip self-test passed" /tmp/server-p17.log /tmp/server.log 2>/dev/null; then
+    pass "P17: pgcrypto round-trip self-test ran + passed at boot"
+  else
+    fail "P17 pgcrypto self-test" "no 'self-test passed' message in /tmp/server-p17.log or /tmp/server.log"
+  fi
 
   echo "== P14: encrypted token round-trip via memory connection =="
   # The memory CONN created at smoke startup has NULL refresh_token (no auth needed for memory
