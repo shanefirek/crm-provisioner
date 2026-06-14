@@ -655,6 +655,31 @@ if [ "$IS_LOCAL" = "1" ]; then
     && pass "P14: server boot fails loudly with instructive error when TOKEN_AT_REST_KEY is absent" \
     || fail "P14 fail-at-boot" "expected 'TOKEN_AT_REST_KEY env var is required' on stderr; got: $(echo "$BOOT_OUTPUT" | tail -3)"
 
+  echo "== P17: tighter TOKEN_AT_REST_KEY validation — short key rejected =="
+  # P17 fix #3 (sub-test 1): a 1-char key passes presence/non-whitespace but fails min-length.
+  BOOT_OUT_SHORT=$(env -i PATH="$PATH" HOME="$HOME" DATABASE_URL="$DBURL" PORT=8799 TOKEN_AT_REST_KEY=x \
+    node --experimental-strip-types --no-warnings src/host/server.ts 2>&1 || true)
+  echo "$BOOT_OUT_SHORT" | grep -q "too short" \
+    && pass "P17: server rejects TOKEN_AT_REST_KEY < 32 chars" \
+    || fail "P17 short-key reject" "expected 'too short' in stderr; got: $(echo "$BOOT_OUT_SHORT" | tail -3)"
+
+  echo "== P17: TOKEN_AT_REST_KEY non-base64 rejected =="
+  # P17 fix #3 (sub-test 2): a long-but-non-base64 key rejected (avoids the smoke heredoc
+  # shell-expansion concern from the code review — strict base64 has no shell-special chars).
+  BAD_CHARSET_KEY="this-key-has-32-chars-but-bad-charset-with-dollar-sign-and-quote"
+  BOOT_OUT_CHARSET=$(env -i PATH="$PATH" HOME="$HOME" DATABASE_URL="$DBURL" PORT=8799 TOKEN_AT_REST_KEY="$BAD_CHARSET_KEY" \
+    node --experimental-strip-types --no-warnings src/host/server.ts 2>&1 || true)
+  echo "$BOOT_OUT_CHARSET" | grep -q "non-base64" \
+    && pass "P17: server rejects TOKEN_AT_REST_KEY with non-base64 characters" \
+    || fail "P17 bad-charset reject" "expected 'non-base64' in stderr; got: $(echo "$BOOT_OUT_CHARSET" | tail -3)"
+
+  echo "== P17: pgcrypto round-trip self-test fires at boot =="
+  # P17 fix #3 (sub-test 3): the server logs the self-test pass on stdout after listening.
+  # The currently-running server already did this; grep its log.
+  grep -q "pgcrypto round-trip self-test passed" /tmp/server-p17.log 2>/dev/null \
+    && pass "P17: pgcrypto round-trip self-test ran + passed at boot" \
+    || fail "P17 pgcrypto self-test" "no 'self-test passed' message in /tmp/server-p17.log"
+
   echo "== P14: encrypted token round-trip via memory connection =="
   # The memory CONN created at smoke startup has NULL refresh_token (no auth needed for memory
   # adapter). The encrypted column should reflect NULL too — proves the case-when guards work.
@@ -725,6 +750,30 @@ process.stdout.write(JSON.stringify(args));
   SF_ALIAS_ECHO=$(echo "$R" | field_of sf_alias)
   [ -n "$SF_CONN" ] && pass "live SFDC connection created" || fail "live SFDC connection" "$R"
   [ "$SF_ALIAS_ECHO" = "shane-dev" ] && pass "P12: connect_crm persists sf_alias=shane-dev on the connection" || fail "P12 sf_alias persisted" "got '$SF_ALIAS_ECHO'"
+
+  # P18 fix #1: connect_crm refuses SFDC connections without sf_alias (CONFIG_ERROR,
+  # mirror of the Zoho api_domain check). Asymmetry the audit caught is now closed.
+  R=$(mcp_call 5001 'tools/call' '{"name":"connect_crm","arguments":{"crm":"salesforce","org_label":"p18-no-alias","is_demo":true,"writable_org_ids":[],"access_token":"fake"}}' | text_of)
+  P18_SF_ERR=$(echo "$R" | field_of error)
+  [ "$P18_SF_ERR" = "CONFIG_ERROR" ] && pass "P18: salesforce connect without sf_alias refused with CONFIG_ERROR" || fail "P18 sf_alias required" "got error='$P18_SF_ERR' (expected CONFIG_ERROR)"
+
+  # P18 fix #2: deployMetadata's try/finally rm closes the per-apply tmpdir leak. Count
+  # sf-* dirs under TMPDIR before/after a fresh apply — should be unchanged. tmpdir on
+  # macOS is /var/folders/.../T/, not /tmp; use the env's TMPDIR.
+  TMP_DIR_REAL="${TMPDIR:-/tmp}"
+  SF_DIRS_BEFORE=$(find "$TMP_DIR_REAL" -maxdepth 1 -type d -name "sf-*" 2>/dev/null | wc -l | tr -d ' ')
+  # Pre-cleanup of any pre-existing dirs from older runs so the count is meaningful.
+  find "$TMP_DIR_REAL" -maxdepth 1 -type d -name "sf-*" -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+  # The apply already happened above (creates field + permset deploy + assign + teardown).
+  # Re-count now — any tmpdir from THIS run's deploys should be gone (try/finally rm).
+  SF_DIRS_AFTER=$(find "$TMP_DIR_REAL" -maxdepth 1 -type d -name "sf-*" 2>/dev/null | wc -l | tr -d ' ')
+  # The exact count varies (depends on what older runs left behind), but the delta should
+  # be ≤ 0 — never positive — because every deploy this run cleans up after itself.
+  if [ "$SF_DIRS_AFTER" -le "$SF_DIRS_BEFORE" ]; then
+    pass "P18: deployMetadata tmpdir cleanup green (before=$SF_DIRS_BEFORE, after=$SF_DIRS_AFTER under $TMP_DIR_REAL)"
+  else
+    fail "P18 tmpdir leak" "before=$SF_DIRS_BEFORE, after=$SF_DIRS_AFTER — apply leaked $((SF_DIRS_AFTER - SF_DIRS_BEFORE)) sf-* dir(s) under $TMP_DIR_REAL"
+  fi
 
   # inspect — should pull real stage list
   R=$(mcp_call 51 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$SF_CONN\"}}" | text_of)

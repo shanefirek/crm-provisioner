@@ -142,6 +142,21 @@ export function buildMcpServer(): McpServer {
           }),
         );
       }
+      // P18 fix #1: SFDC sf_alias is per-connection tenant config (tier-2), mirror of
+      // Zoho's api_domain check. Pre-P18 the adapter fell back to process.env.SF_ALIAS
+      // (or "shane-dev" hardcoded) when sf_alias was missing — exactly the asymmetric
+      // multi-tenancy violation the review caught. Closing the asymmetry: SFDC connections
+      // must declare sf_alias at create time. (One-builder dev path: set sf_alias='shane-dev'.)
+      if (crm === "salesforce" && !sf_alias) {
+        return ok(
+          JSON.stringify({
+            ok: false,
+            error: "CONFIG_ERROR",
+            message:
+              "salesforce connection requires sf_alias (the `sf` CLI alias to target, e.g. 'shane-dev'). Without it the adapter would silently route to whatever the process-global SF_ALIAS env points at — a multi-tenancy violation. Re-call connect_crm with sf_alias set.",
+          }),
+        );
+      }
       const id = crypto.randomUUID();
       // P14: encrypt token columns at write time. case-when keeps NULL→NULL semantic so
       // memory-adapter connections (which carry no tokens) don't pay pgcrypto's ceremony.
@@ -535,7 +550,13 @@ export function buildMcpServer(): McpServer {
         );
 
         const adapter = adapterFor(conn.crm);
-        const writes: Array<Promise<unknown>> = [];
+        // P17 fix #1: buffer step writes and flush sequentially after the adapter
+        // returns. Same pattern as P10 fix #3 for apply(). PoolClient is not safe
+        // for concurrent query dispatch in node-postgres; the prior writes.push +
+        // Promise.all pattern works today only because every adapter teardown
+        // awaits each step's HTTP/CLI call before invoking onStep — the moment
+        // a batched teardown lands the protocol interleave bites.
+        const pendingStepRows: Array<unknown[]> = [];
         // P6: collect successful reversals so we can clear matching cache rows
         // (the resource is gone, so any future create attempt has a clean slate).
         const cacheClears: Array<{ operation: string; payload: unknown }> = [];
@@ -544,25 +565,26 @@ export function buildMcpServer(): McpServer {
             const orig = history.find((h) => h.seq === step.seq);
             if (orig) cacheClears.push({ operation: orig.operation, payload: orig.payload });
           }
-          writes.push(
-            client.query(
-              `insert into run_steps (run_id, seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, started_at, finished_at)
-                 values ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, false, extract(epoch from now())::integer, extract(epoch from now())::integer)`,
-              [
-                teardown_id,
-                step.seq,
-                `teardown:${history.find((h) => h.seq === step.seq)?.operation ?? "unknown"}`,
-                history.find((h) => h.seq === step.seq)?.target ?? null,
-                JSON.stringify(history.find((h) => h.seq === step.seq)?.payload ?? null),
-                step.status,
-                step.result ? JSON.stringify(step.result) : null,
-                step.error?.code ?? null,
-                step.error?.message ?? null,
-              ],
-            ),
-          );
+          const orig = history.find((h) => h.seq === step.seq);
+          pendingStepRows.push([
+            teardown_id,
+            step.seq,
+            `teardown:${orig?.operation ?? "unknown"}`,
+            orig?.target ?? null,
+            JSON.stringify(orig?.payload ?? null),
+            step.status,
+            step.result ? JSON.stringify(step.result) : null,
+            step.error?.code ?? null,
+            step.error?.message ?? null,
+          ]);
         });
-        await Promise.all(writes);
+        for (const params of pendingStepRows) {
+          await client.query(
+            `insert into run_steps (run_id, seq, operation, target, payload_json, status, result_json, error_code, error_message, destructive, started_at, finished_at)
+               values ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, false, extract(epoch from now())::integer, extract(epoch from now())::integer)`,
+            params,
+          );
+        }
 
         await client.query(`update runs set status = $1, finished_at = extract(epoch from now())::integer where id = $2`, [result.status, teardown_id]);
         await client.query("commit");
