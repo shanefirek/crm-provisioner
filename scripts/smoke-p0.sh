@@ -560,6 +560,73 @@ else
   fail "P10 concurrent isolation" "A status=$SA error=$EA; B status=$SB error=$EB — expected each to be succeeded/partial/aborted/PLAN_NOT_FOUND"
 fi
 
+echo "== P15: advisory-lock serialization on concurrent applies (same conn) =="
+# P15 fix #1: host wraps apply in pg_advisory_xact_lock(hashtext('apply-'||crm||'-'||api_domain)).
+# Two concurrent applies on the same connection MUST serialize through the lock — proven via
+# run_steps timestamps: every step in B starts no earlier than A's last step finished.
+# Only meaningful on local PG (remote BASE smoke skipped per IS_LOCAL gating).
+if [ "$IS_LOCAL" = "1" ]; then
+  R=$(mcp_call 150 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p15-lock","is_demo":true,"api_domain":"memory://p15lock","writable_org_ids":["memory://p15lock"]}}' | text_of)
+  P15_CONN=$(echo "$R" | field_of connection_id)
+  P15_DELTA_A=$(node -e "
+const fields=[];
+for (let i=1;i<=5;i++) fields.push({api_name:'p15_lock_A_'+i,label:'x',kind:'text',module:'Lead'});
+process.stdout.write(JSON.stringify({spec_version:0,fields,stages:[],pipelines:[],workflows:[]}));")
+  P15_DELTA_B=$(node -e "
+const fields=[];
+for (let i=1;i<=5;i++) fields.push({api_name:'p15_lock_B_'+i,label:'x',kind:'text',module:'Lead'});
+process.stdout.write(JSON.stringify({spec_version:0,fields,stages:[],pipelines:[],workflows:[]}));")
+  R=$(mcp_call 151 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P15_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P15_DELTA_A}}" | text_of)
+  P15_PLAN_A=$(echo "$R" | field_of plan_id)
+  R=$(mcp_call 152 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$P15_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$P15_DELTA_B}}" | text_of)
+  P15_PLAN_B=$(echo "$R" | field_of plan_id)
+  mcp_call 153 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P15_PLAN_A\"}}" >/tmp/p15-a.out 2>&1 &
+  PIDA=$!
+  mcp_call 154 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P15_PLAN_B\"}}" >/tmp/p15-b.out 2>&1 &
+  PIDB=$!
+  wait $PIDA; wait $PIDB
+  P15_RA=$(cat /tmp/p15-a.out | text_of | field_of run_id)
+  P15_RB=$(cat /tmp/p15-b.out | text_of | field_of run_id)
+  if [ -n "$P15_RA" ] && [ -n "$P15_RB" ]; then
+    OVERLAP=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -tA <<SQL
+with a as (select min(started_at) as a_start, max(finished_at) as a_end from run_steps where run_id = '$P15_RA'),
+     b as (select min(started_at) as b_start, max(finished_at) as b_end from run_steps where run_id = '$P15_RB')
+select case
+  when a.a_end <= b.b_start then 'serial:a-then-b'
+  when b.b_end <= a.a_start then 'serial:b-then-a'
+  else 'overlap'
+end from a, b;
+SQL
+)
+    if [ "$OVERLAP" = "serial:a-then-b" ] || [ "$OVERLAP" = "serial:b-then-a" ]; then
+      pass "P15: concurrent applies on same conn serialized via advisory lock ($OVERLAP)"
+    else
+      fail "P15 lock serialization" "got '$OVERLAP' — runs interleaved despite the lock (race window still open)"
+    fi
+  else
+    fail "P15 advisory-lock setup" "missing run_ids: A='$P15_RA' B='$P15_RB'"
+  fi
+else
+  skip "P15 advisory-lock serialization" "BASE=$BASE is non-local — psql probes against remote PG aren't reachable for the timestamp comparison."
+fi
+
+echo "== P15: dedup-before-aborted_by — no duplicate skipped_by_watchdog rows =="
+# P15 fix #4: existing P7 6-of-N failure-rate trip + future pre-batch trips must produce
+# exactly ONE row per (run_id, seq) in run_steps with status=skipped_by_watchdog. Pre-fix
+# the pre-batch trip path would have produced 2 (no UNIQUE constraint to catch it).
+if [ "$IS_LOCAL" = "1" ]; then
+  P15_DEDUP_ROWS=$(PGPASSWORD=crm psql -h 127.0.0.1 -p 5433 -U crm -d crm_provisioner -tA <<SQL 2>/dev/null
+select coalesce(max(c),1) from (
+  select count(*) as c from run_steps where status='skipped_by_watchdog'
+  group by run_id, seq
+) g;
+SQL
+)
+  [ "$P15_DEDUP_ROWS" = "1" ] && pass "P15: every (run_id, seq) has exactly one skipped_by_watchdog row (dedup-first ordering green)" || fail "P15 dedup-first" "max rows per (run_id, seq) = $P15_DEDUP_ROWS (expected 1)"
+else
+  skip "P15 dedup-first ordering" "BASE=$BASE is non-local — psql probes against remote PG aren't reachable."
+fi
+
 echo "== P10: Zoho connect without api_domain → CONFIG_ERROR =="
 # configuration-philosophy tier-2 fail-at-boot: previously the adapter silently fell back
 # to zohoapis.com, breaking every non-com DC customer.

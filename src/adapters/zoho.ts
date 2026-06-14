@@ -13,6 +13,7 @@
 
 import type { ProvisionSpec, StageSpec, WorkflowShape } from "../core/spec.ts";
 import { BoundaryError, classifyZohoResponse, ConfigError, describeThrown, retryBoundary } from "../host/errors.ts";
+import { runApplyLoop } from "./lifecycle.ts";
 import type {
   Adapter,
   ApplyResult,
@@ -538,99 +539,35 @@ export const zohoAdapter: Adapter = {
   },
 
   async apply(conn, plan, onStep, shouldAbort?: ShouldAbortFn): Promise<ApplyResult> {
-    const results: StepResult[] = [];
-    let failed = false;
-    let aborted_by: string | undefined;
-    // Fresh snapshot for any step that needs id lookups (stage_field_id, layout_id, etc.)
+    // P16: shared apply lifecycle. Scaffold owns the loop / dedup / abort cascade /
+    // standard skip branches / error wrapping. Adapter owns the batch deploy (whole-
+    // array PATCH for stages) + the per-step dispatch (vendor REST calls).
     const snap = await snapshot(conn);
-
-    // Batch stages: collect first, single PATCH.
     const stageBatch = plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop").map((s) => s.payload as StageSpec);
-    if (stageBatch.length) {
-      // P12: gate the batch on shouldAbort BEFORE dispatching the PATCH (defense in depth;
-      // contract is "writes are gated on watchdog," batch is a write). Mirrors the SFDC
-      // adapter's pre-batch check. Audit finding #2.
-      const preVerdict = shouldAbort?.();
-      if (preVerdict) {
-        aborted_by = preVerdict.reason;
-        for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
-          const r: StepResult = { seq: s.seq, status: "skipped_by_watchdog", result: { reason: preVerdict.reason } };
-          results.push(r); onStep(r);
-        }
-      } else {
-        try {
-          // P10: retry boundary errors (5xx, 429); raise DataError immediately.
-          await retryBoundary(() => addStages(conn, stageBatch, snap));
-        } catch (e) {
-          failed = true;
-          for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
-            const d = describeThrown(e);
-            const r: StepResult = { seq: s.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
-            results.push(r); onStep(r);
-          }
-        }
-      }
-    }
 
-    for (const step of plan.steps) {
-      if (aborted_by) {
-        const r: StepResult = { seq: step.seq, status: "skipped_by_watchdog", result: { reason: aborted_by } };
-        results.push(r); onStep(r); continue;
-      }
-      // Stage step results were pushed by the batch above
-      if (step.operation === "add_stage") {
-        if (results.some((r) => r.seq === step.seq)) continue;
-        const r: StepResult = step.diff === "noop"
-          ? { seq: step.seq, status: "succeeded", result: { noop: true } }
-          : { seq: step.seq, status: "succeeded", result: { deployed_in_batch: true } };
-        results.push(r); onStep(r);
-        continue;
-      }
-      if (step.diff === "noop") {
-        const r: StepResult = { seq: step.seq, status: "succeeded", result: { noop: true } };
-        results.push(r); onStep(r); continue;
-      }
-      if (step.diff === "unsupported") {
-        const r: StepResult = { seq: step.seq, status: "skipped_unsupported", result: { reason: step.notes } };
-        results.push(r); onStep(r); continue;
-      }
-      if (step.diff === "blocked_by_prior_failure") {
-        const r: StepResult = { seq: step.seq, status: "skipped_blocked", result: { reason: step.notes } };
-        results.push(r); onStep(r); continue;
-      }
-      try {
+    return runApplyLoop(conn, plan, onStep, shouldAbort, {
+      batch: stageBatch.length > 0 ? {
+        collect: (steps) => steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop"),
+        deploy: () => retryBoundary(() => addStages(conn, stageBatch, snap)).then(() => undefined),
+        operationName: "add_stage",
+      } : undefined,
+
+      dispatch: async (step): Promise<unknown> => {
         if (step.operation === "create_field") {
-          const res = await retryBoundary(() => createField(conn, step.payload as FieldPayload));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
-          results.push(r); onStep(r);
-        } else if (step.operation === "create_pipeline") {
-          const res = await retryBoundary(() => createPipeline(conn, step.payload as { api_name: string; label: string; stages: string[] }, snap));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
-          results.push(r); onStep(r);
-        } else if (step.operation === "create_workflow:idle_deal_alert") {
-          const res = await retryBoundary(() => createIdleDealAlertWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "idle_deal_alert" }>));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
-          results.push(r); onStep(r);
-        } else if (step.operation === "create_workflow:field_derivation") {
-          const res = await retryBoundary(() => createFieldDerivationWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "field_derivation" }>));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
-          results.push(r); onStep(r);
-        } else {
-          const r: StepResult = { seq: step.seq, status: "skipped_unsupported", result: { reason: "operation not implemented in Zoho adapter" } };
-          results.push(r); onStep(r);
+          return await retryBoundary(() => createField(conn, step.payload as FieldPayload));
         }
-      } catch (e) {
-        failed = true;
-        const d = describeThrown(e);
-        const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
-        results.push(r); onStep(r);
-      }
-      const verdict = shouldAbort?.();
-      if (verdict) aborted_by = verdict.reason;
-    }
-
-    if (aborted_by) return { status: "aborted", steps: results, aborted_by };
-    return { status: failed ? "partial" : "succeeded", steps: results };
+        if (step.operation === "create_pipeline") {
+          return await retryBoundary(() => createPipeline(conn, step.payload as { api_name: string; label: string; stages: string[] }, snap));
+        }
+        if (step.operation === "create_workflow:idle_deal_alert") {
+          return await retryBoundary(() => createIdleDealAlertWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "idle_deal_alert" }>));
+        }
+        if (step.operation === "create_workflow:field_derivation") {
+          return await retryBoundary(() => createFieldDerivationWorkflow(conn, step.payload as Extract<WorkflowShape, { shape: "field_derivation" }>));
+        }
+        throw new Error(`zoho adapter dispatch: no handler for operation '${step.operation}'`);
+      },
+    });
   },
 
   async teardown(conn, steps, onStep): Promise<ApplyResult> {
@@ -673,13 +610,13 @@ export const zohoAdapter: Adapter = {
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "add_stage", residue: "stage_picklist_value_remains" } };
           results.push(r); onStep(r);
         } else if (step.operation.startsWith("create_workflow:")) {
-          // P12: workflow_rule teardown actually DELETEs the rule. Audit finding #7:
-          // previously this branch fell through to the silent-noop else clause; the rule
-          // stayed live in the org while the run ledger said "succeeded". ai-output-handling
-          // AP#8 applied at the teardown layer.
-          // The apply step's result stored {workflow_rule_id, ...}. If the id is missing
-          // (older runs pre-P12, or non-standard result shape), record honest residue.
-          const resultJson = step.result as { workflow_rule_id?: string } | null;
+          // P12: workflow_rule teardown actually DELETEs the rule. Audit finding #7.
+          // P15 fix #3: ALSO DELETE the linked task_action / field_update — Zoho doesn't
+          // cascade-delete actions when the parent rule is removed, and apply uses
+          // deterministic prov_<api>_task / prov_<api>_fu names, so orphans collide
+          // on the next apply (DUPLICATE_DATA / 'name already exists'). Order: rule
+          // first (removes references), then the actions (now safely orphaned).
+          const resultJson = step.result as { workflow_rule_id?: string; task_action_id?: string; field_update_id?: string } | null;
           const wfId = resultJson?.workflow_rule_id;
           if (!wfId) {
             const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: step.operation, residue: "workflow_rule_id_missing", note: "older run without stored id — manual cleanup required" } };
@@ -687,7 +624,21 @@ export const zohoAdapter: Adapter = {
           } else {
             const del = await zoho(conn, `/crm/v8/settings/automation/workflow_rules/${wfId}`, { method: "DELETE" });
             if (del.status >= 400) throw classifyZohoResponse({ status: del.status, body: del.body, retryAfterHeader: del.retryAfter });
-            const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: step.operation, deleted_workflow_rule_id: wfId } };
+            const deletedActionIds: Array<{ kind: string; id: string }> = [];
+            // Helper: 404 is treated as already-gone success (idempotent teardown).
+            const tryDeleteAction = async (kind: "tasks" | "field_updates", id: string) => {
+              const r = await zoho(conn, `/crm/v8/settings/automation/${kind}/${id}`, { method: "DELETE" });
+              if (r.status === 404) return; // already gone — fine
+              if (r.status >= 400) throw classifyZohoResponse({ status: r.status, body: r.body, retryAfterHeader: r.retryAfter });
+              deletedActionIds.push({ kind, id });
+            };
+            if (step.operation === "create_workflow:idle_deal_alert" && resultJson?.task_action_id) {
+              await tryDeleteAction("tasks", resultJson.task_action_id);
+            }
+            if (step.operation === "create_workflow:field_derivation" && resultJson?.field_update_id) {
+              await tryDeleteAction("field_updates", resultJson.field_update_id);
+            }
+            const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: step.operation, deleted_workflow_rule_id: wfId, deleted_action_ids: deletedActionIds } };
             results.push(r); onStep(r);
           }
         } else {

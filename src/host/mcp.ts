@@ -323,6 +323,15 @@ export function buildMcpServer(): McpServer {
       const client = await db.connect();
       try {
         await client.query("begin");
+        // P15 fix #1: serialize concurrent applies against the same CRM org. The
+        // SFDC PermissionSet read-modify-write (deployPermissionSet) and the Zoho
+        // pipeline whole-array PATCH are both racy across two concurrent applies
+        // on the same target — second write silently overwrites the first (the AP#8
+        // silent-write-loss the rest of the audit chain has been fixing). xact_lock
+        // auto-releases on commit/rollback. Lock key: per-(crm, target) so unrelated
+        // orgs don't block each other.
+        const lockKey = `apply-${conn.crm}-${conn.api_domain ?? conn.id}`;
+        await client.query(`select pg_advisory_xact_lock(hashtext($1))`, [lockKey]);
         await client.query(
           `insert into runs (id, connection_id, spec_hash, template_id, template_version, status, plan_json, trace_id)
              values ($1, $2, $3, $4, $5, 'running', $6::jsonb, $7)`,

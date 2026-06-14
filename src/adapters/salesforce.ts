@@ -13,6 +13,7 @@
 
 import type { ProvisionSpec, StageSpec, WorkflowShape } from "../core/spec.ts";
 import { BoundaryError, classifySfdcResponse, describeThrown, retryBoundary } from "../host/errors.ts";
+import { runApplyLoop } from "./lifecycle.ts";
 import type {
   Adapter,
   ApplyResult,
@@ -697,109 +698,68 @@ export const salesforceAdapter: Adapter = {
   },
 
   async apply(conn, plan, onStep, shouldAbort?: ShouldAbortFn): Promise<ApplyResult> {
-    const results: StepResult[] = [];
-    let failed = false;
-    let aborted_by: string | undefined;
-
-    // Batch stages — collect first, deploy once.
+    // P16: shared apply lifecycle. The scaffold owns the loop / dedup / abort cascade
+    // / standard skip branches / error wrapping. The adapter owns the batch deploy
+    // (StandardValueSet for stages) + the per-step dispatch (vendor REST/CLI calls).
     const stageBatch: StagePayload[] = [];
     for (const step of plan.steps) {
       if (step.operation === "add_stage" && step.diff !== "noop") stageBatch.push(step.payload as StagePayload);
     }
-    if (stageBatch.length) {
-      // P12: check shouldAbort BEFORE initiating the batch deploy (metadata deploys take
-      // 10-30s and commit a real write). Defense-in-depth even though today's watchdog
-      // can't trip before the loop runs — the contract is "writes are gated on watchdog,"
-      // and the batch is a write. error-handling-philosophy + watchdog rule.
-      const preVerdict = shouldAbort?.();
-      if (preVerdict) {
-        aborted_by = preVerdict.reason;
-        for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
-          const r: StepResult = { seq: s.seq, status: "skipped_by_watchdog", result: { reason: preVerdict.reason } };
-          results.push(r); onStep(r);
-        }
-      } else {
-        try {
-          await retryBoundary(() => deployStandardValueSet(conn, stageBatch));
-        }
-        catch (e) {
-          failed = true;
-          const d = describeThrown(e);
-          for (const s of plan.steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop")) {
-            const r: StepResult = { seq: s.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
-            results.push(r); onStep(r);
-          }
-        }
-      }
-    }
 
-    for (const step of plan.steps) {
-      if (aborted_by) {
-        const r: StepResult = { seq: step.seq, status: "skipped_by_watchdog", result: { reason: aborted_by } };
-        results.push(r); onStep(r); continue;
-      }
-      // Stage steps either succeeded as part of the batch above, or were already pushed as failures
-      if (step.operation === "add_stage") {
-        if (results.some((r) => r.seq === step.seq)) continue;
-        const r: StepResult = step.diff === "noop"
-          ? { seq: step.seq, status: "succeeded", result: { noop: true } }
-          : { seq: step.seq, status: "succeeded", result: { deployed_in_batch: true } };
-        results.push(r); onStep(r);
-        continue;
-      }
+    return runApplyLoop(conn, plan, onStep, shouldAbort, {
+      batch: stageBatch.length > 0 ? {
+        collect: (steps) => steps.filter((s) => s.operation === "add_stage" && s.diff !== "noop"),
+        deploy: () => retryBoundary(() => deployStandardValueSet(conn, stageBatch)).then(() => undefined),
+        operationName: "add_stage",
+      } : undefined,
 
-      if (step.diff === "noop") {
-        const r: StepResult = { seq: step.seq, status: "succeeded", result: { noop: true } };
-        results.push(r); onStep(r); continue;
-      }
-      if (step.diff === "unsupported") {
-        const r: StepResult = { seq: step.seq, status: "skipped_unsupported" };
-        results.push(r); onStep(r); continue;
-      }
-      if (step.diff === "blocked_by_prior_failure") {
-        const r: StepResult = { seq: step.seq, status: "skipped_blocked", result: { reason: step.notes } };
-        results.push(r); onStep(r); continue;
-      }
-
-      try {
+      dispatch: async (step, priorResults): Promise<unknown> => {
         if (step.operation === "create_field") {
-          // P5: retry boundary errors (5xx, 429); raise DataError immediately.
-          const res = await retryBoundary(() => createField(conn, step.payload as FieldPayload));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: res };
-          results.push(r); onStep(r);
-        } else if (step.operation === "grant_field_visibility") {
-          // P9: deploy the shared PROVISIONER_PERMSET with Read+Edit on every spec field,
-          // then assign to the connection user (admin). Without this, create_field above
-          // landed bytes in metadata but no SOQL can see them — ai-output-handling AP#8.
-          const payload = step.payload as { permset: string; fields: string[] };
-          await retryBoundary(() => deployPermissionSet(conn, payload.permset, payload.fields));
-          await retryBoundary(() => assignPermissionSet(conn, payload.permset));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: { permset: payload.permset, fields_granted: payload.fields.length } };
-          results.push(r); onStep(r);
-        } else if (step.operation.startsWith("create_workflow:")) {
-          await retryBoundary(() => deployFlow(conn, step.payload as WorkflowPayload));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: { flow_deployed: true } };
-          results.push(r); onStep(r);
-        } else if (step.operation === "create_pipeline") {
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: { noop: "sfdc-stages-handled-via-svs" } };
-          results.push(r); onStep(r);
-        } else {
-          const r: StepResult = { seq: step.seq, status: "skipped_unsupported" };
-          results.push(r); onStep(r);
+          return await retryBoundary(() => createField(conn, step.payload as FieldPayload));
         }
-      } catch (e: unknown) {
-        failed = true;
-        const d = describeThrown(e);
-        const r: StepResult = { seq: step.seq, status: "failed", error: { code: d.typedCode, message: d.message, attempts: d.attempts } };
-        results.push(r); onStep(r);
-      }
-      // P7: watchdog check between steps.
-      const verdict = shouldAbort?.();
-      if (verdict) aborted_by = verdict.reason;
-    }
-
-    if (aborted_by) return { status: "aborted", steps: results, aborted_by };
-    return { status: failed ? "partial" : "succeeded", steps: results };
+        if (step.operation === "grant_field_visibility") {
+          // P9: deploy the shared PROVISIONER_PERMSET with Read+Edit on every spec field
+          // (ai-output-handling AP#8 — without this, create_field landed bytes in metadata
+          // but no SOQL can see them).
+          // P15 fix #2: filter to fullnames whose create_field succeeded THIS run. SFDC
+          // metadata deploys are atomic — one missing field reference fails the whole
+          // permset deploy, taking FLS down for surviving fields too.
+          const payload = step.payload as { permset: string; fields: string[] };
+          const succeededFields = new Set<string>();
+          for (const s of plan.steps) {
+            if (s.operation !== "create_field") continue;
+            const r = priorResults.find((x) => x.seq === s.seq);
+            const succeeded = r?.status === "succeeded" || s.diff === "noop";
+            if (succeeded) {
+              const f = s.payload as FieldPayload;
+              succeededFields.add(leadCustomFullName(f.module === "Leads" ? "Lead" : f.module, f.api_name));
+            }
+          }
+          const filteredFields = payload.fields.filter((fn) => succeededFields.has(fn));
+          if (filteredFields.length === 0) {
+            return { permset: payload.permset, fields_granted: 0, note: "no fields to grant — all create_field steps failed or were skipped this run" };
+          }
+          await retryBoundary(() => deployPermissionSet(conn, payload.permset, filteredFields));
+          await retryBoundary(() => assignPermissionSet(conn, payload.permset));
+          const skipped = payload.fields.length - filteredFields.length;
+          return skipped > 0
+            ? { permset: payload.permset, fields_granted: filteredFields.length, fields_skipped_due_to_create_failure: skipped }
+            : { permset: payload.permset, fields_granted: filteredFields.length };
+        }
+        if (step.operation.startsWith("create_workflow:")) {
+          await retryBoundary(() => deployFlow(conn, step.payload as WorkflowPayload));
+          return { flow_deployed: true };
+        }
+        if (step.operation === "create_pipeline") {
+          // SFDC: pipelines are the StandardValueSet on Opportunity.StageName — handled by stage batch.
+          return { noop: "sfdc-stages-handled-via-svs" };
+        }
+        // Unknown operation — planSpec is well-formed in v1 (only emits the known ops
+        // above), so reaching here is a programming error. Throw → scaffold marks failed
+        // with the typed-error class, which is the loud-failure ai-output-handling rule.
+        throw new Error(`sfdc adapter dispatch: no handler for operation '${step.operation}'`);
+      },
+    });
   },
 
   async teardown(conn, steps, onStep): Promise<ApplyResult> {
