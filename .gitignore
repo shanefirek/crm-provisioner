@@ -4,3 +4,7 @@ node_modules/
 *.log
 fixtures/**/tokens*
 fixtures/**/auth*
+
+# Local-only context (strategic/venture/business layer) — never distributed.
+# A pointer in CLAUDE.md ships so local agents auto-discover it; the content does not.
+*.local.md

@@ -22,7 +22,7 @@ P3's capability map said `assignment_rules: ❌ manual` and all workflow shapes 
 
 | Thing | Documented surface | Adapter verdict | Workaround |
 |---|---|---|---|
-| Standalone Deluge function | None | `manual` | User creates the function once in UI (Setup > Developer Hub > Functions), then the adapter references it by ID inside a workflow rule's `actions` |
+| Standalone Deluge function | `POST /crm/v8/settings/functions` (**corrected 2026-06-14**) | REST-creatable, admin-gated, **adapter wiring pending** | See "Programmatic Deluge function creation" section below. Until the adapter wires it, user can create once in UI (Setup > Developer Hub > Functions) and reference by ID in a workflow rule's `actions` |
 | Email template | GET only | `manual` | User creates the template once in UI; idle_deal_alert and any email-based shape can fall back to `automation_tasks` action (no template needed) |
 | CRM Variable | None documented | `manual` | Used as state for round-robin patterns; created once in UI |
 
@@ -49,9 +49,9 @@ Sets `target_field` from `source_field` when the trigger fires.
    - `execute_when.type` from `spec.when`: `on_create` → `create`, `on_update` → `edit`, `on_save` → `create_or_edit`
    - `conditions[0].instant_actions.actions[0]`: `{ id: <field_update id>, type: "field_updates" }`
 
-### round_robin_assignment (stays MANUAL — no REST path)
+### round_robin_assignment (Deluge IS REST-creatable; adapter wiring pending)
 
-True round-robin in Zoho requires a Deluge function (to compute "next user in pool"). Functions are not REST-creatable. The adapter marks this `manual` and the demo runbook tells the user:
+True round-robin in Zoho requires a Deluge function (to compute "next user in pool"). **That function is REST-creatable** — see "Programmatic Deluge function creation" below; the earlier "not REST-creatable" claim was a false verdict from a single malformed S0 probe, corrected 2026-06-14. The adapter still emits `manual` for now only because it does not yet implement the `createDelugeFunction` builder. Until that phase lands, the demo runbook tells the user:
 
 > Create this function once in UI (Setup > Developer Hub > Functions), paste the script below, then the adapter will reference it by ID inside any workflow that needs round-robin.
 
@@ -107,6 +107,32 @@ createTask = zoho.crm.createRecord("Tasks",newtask);
 Substitution points: `{ProfileName}` (e.g. "Service Agent"), `{TaskSubjectPrefix}` (e.g. "Round Robin Follow-up").
 
 State is held in the most-recently-created Task — no CRM Variable needed. (The Zoho-official solution uses CRM Variables; this version uses task search, which is simpler and equally correct.)
+
+## Programmatic Deluge function creation (probed live 2026-06-14)
+
+The create endpoint is **real**. It is `POST /crm/v8/settings/functions` and takes a **form-encoded** body (NOT JSON — a JSON body returns `REQUIRED_PARAM_MISSING: metadata`, which is the exact error S0 hit and wrongly read as "no surface"). The `metadata` form field is a JSON object containing a `functions` array:
+
+```
+POST /crm/v8/settings/functions
+Authorization: Zoho-oauthtoken <token>
+Content-Type: application/x-www-form-urlencoded
+
+metadata={"functions":[{
+  "name":         "<api_name>",
+  "display_name": "<label>",
+  "category":     "Automation",       // enum: Button|Automation|Schedule|Related List|Standalone|Signals|Validation Rule|Dynamic
+  "runtime":      "Deluge 1.0",       // enum: Deluge 1.0|Java 8|Java 17|NodeJS 8|NodeJS 22|Python 3.12
+  "script":       "void automation.<api_name>(){ ... }",
+  "params":       []
+}]}
+```
+
+Validation walks field-by-field (`name → category → runtime → script`); a well-formed body passes the entire schema. The remaining gate is **authorization, not capability**:
+
+- `"initial function creation is restricted to administrators"` — the connection must be authorized by an **org admin**, and the org's Functions/Developer space must be enabled once (admin creates any function in the UI the first time).
+- Reading users (`GET /crm/v8/users`) for the round-robin pool needs `ZohoCRM.users.READ` scope — the narrow `.dev.vars` token lacked it; re-grant with `ZohoCRM.settings.ALL,ZohoCRM.modules.ALL,ZohoCRM.users.READ`.
+
+Status: **REST capability proven; a literal 201 + the `createDelugeFunction` adapter builder are pending an admin-authorized connection.** This is the next phase, not a research unknown.
 
 ## Verified body shapes (from official v8 docs)
 

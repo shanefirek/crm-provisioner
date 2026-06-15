@@ -10,7 +10,8 @@ CRM-agnostic provisioning engine: natural language → typed `ProvisionSpec` (te
 
 | File | When to read |
 |---|---|
-| [`docs/session-pickup.md`](./docs/session-pickup.md) | **FIRST.** Cold-session handoff doc — capabilities, gaps, run-commands, read-order table |
+| `docs/venture-context.local.md` (if present — gitignored, local-only) | **FIRST for STRATEGIC/business state** — who's who, the why, where the deal stands. Not the code. Never distributed; absent in any clone you hand off. |
+| [`docs/session-pickup.md`](./docs/session-pickup.md) | **FIRST for TECHNICAL state.** Cold-session handoff doc — capabilities, gaps, run-commands, read-order table |
 | [`docs/iteration-plan.md`](./docs/iteration-plan.md) | Current phase, gate, defer column, full per-phase retro chronology |
 | [`docs/architecture.md`](./docs/architecture.md) | Before touching structure; contains the principle audit table |
 | [`docs/decision-log.md`](./docs/decision-log.md) | Why things are the way they are (dated, founding decisions + post-MVP pivots) |

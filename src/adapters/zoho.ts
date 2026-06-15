@@ -6,13 +6,17 @@
 //   - fields: ✅ POST /settings/fields?module=... ; visible-by-default (no FLS step)
 //   - stages: ⚠️  PATCH /settings/fields/{stageFieldId}?module=Deals — whole-array replace
 //   - pipelines: ✅ POST /settings/pipeline?layout_id=... ; references EXISTING stage IDs
-//   - workflows: ⚠️ Deluge functions exist but body shape eluded S0 probing — marked
-//     unsupported until P3.5 nails the shape (Varun's input slot). Plan surfaces as
-//     `diff: unsupported`, apply skips.
+//   - workflows: ✅ workflow_rule + action builders (tasks/field_updates). Deluge
+//     standalone functions ARE REST-creatable: POST /crm/v8/settings/functions with a
+//     form-encoded `metadata={"functions":[{name,display_name,category:"Automation",
+//     runtime:"Deluge 1.0",script,params}]}` body (validated end-to-end against the live
+//     trial org 2026-06-14). Creation requires an admin-authorized connection ("initial
+//     function creation is restricted to administrators"). round_robin_assignment is not
+//     yet WIRED in the adapter (no createDelugeFunction builder) — see CAPS note below.
 //   - assignment_rules: ❌ no v8 REST create surface — UNSUPPORTED.
 
 import type { ProvisionSpec, StageSpec, WorkflowShape } from "../core/spec.ts";
-import { BoundaryError, classifyZohoResponse, ConfigError, describeThrown, retryBoundary } from "../host/errors.ts";
+import { BoundaryError, classifyZohoResponse, ConfigError, DataError, describeThrown, retryBoundary } from "../host/errors.ts";
 import { runApplyLoop } from "./lifecycle.ts";
 import type {
   Adapter,
@@ -37,10 +41,13 @@ const CAPS: CapabilityMap = {
   workflows: {
     idle_deal_alert: "supported",          // workflow_rule + scheduled_actions[automation_tasks]
     field_derivation: "supported",         // workflow_rule + instant_actions[field_updates]
-    round_robin_assignment: "manual",      // requires a Deluge function; functions are UI-only.
-                                            // Canonical script in zoho-deluge-patterns.md;
-                                            // adapter records "manual" so plan output instructs
-                                            // the user to paste the function once in UI.
+    round_robin_assignment: "manual",      // needs a Deluge function. Functions ARE
+                                            // REST-creatable (POST /settings/functions,
+                                            // admin-gated — see header comment + patterns
+                                            // doc). NOT YET WIRED: the adapter has no
+                                            // createDelugeFunction builder, so until that
+                                            // phase lands this stays a manual step. Canonical
+                                            // script in zoho-deluge-patterns.md.
   },
   assignment_rules: "unsupported",          // Still no v8 REST surface for Lead AssignmentRules
                                             // specifically (different from workflow rules).
@@ -116,11 +123,12 @@ async function zoho(
 // --- Snapshot --------------------------------------------------------------
 
 type Snapshot = {
-  fields_lead: Array<{ id: string; api_name: string }>;
+  // P20: data_type/length carry the field's shape for adopt-or-create compatibility.
+  fields_lead: Array<{ id: string; api_name: string; data_type: string | null; length: number | null }>;
   // P12: Deals custom fields. Previously the teardown branch for non-Leads modules
   // re-fetched a full snapshot AND mis-aliased `fields_lead` for Deals lookups (audit
   // finding #4 + a side-effect bug — Deals teardown lookups never resolved).
-  fields_deals: Array<{ id: string; api_name: string }>;
+  fields_deals: Array<{ id: string; api_name: string; data_type: string | null; length: number | null }>;
   stages: Array<{ id: string; api_name: string; probability: number; forecast_category_id: string; forecast_category_name: string }>;
   pipelines: Array<{ id: string; api_name: string }>;
   stage_field_id: string | null;
@@ -129,12 +137,12 @@ type Snapshot = {
 
 async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
   const leadFields = await zoho(conn, "/crm/v8/settings/fields?module=Leads");
-  const fields_lead = (((leadFields.body as { fields?: Array<{ id: string; api_name: string }> })?.fields) ?? [])
+  const fields_lead = (((leadFields.body as { fields?: Array<{ id: string; api_name: string; data_type?: string; length?: number }> })?.fields) ?? [])
     .filter((f) => !!f.api_name)
-    .map((f) => ({ id: f.id, api_name: f.api_name }));
+    .map((f) => ({ id: f.id, api_name: f.api_name, data_type: f.data_type ?? null, length: f.length ?? null }));
 
   const dealFields = await zoho(conn, "/crm/v8/settings/fields?module=Deals");
-  const dealFieldList = ((dealFields.body as { fields?: Array<{ id: string; api_name: string; pick_list_values?: Array<{ id: string; actual_value: string; probability: number; forecast_category?: { id: string; name: string } }> }> })?.fields ?? []);
+  const dealFieldList = ((dealFields.body as { fields?: Array<{ id: string; api_name: string; data_type?: string; length?: number; pick_list_values?: Array<{ id: string; actual_value: string; probability: number; forecast_category?: { id: string; name: string } }> }> })?.fields ?? []);
   const stageField = dealFieldList.find((f) => f.api_name === "Stage");
   const stages = (stageField?.pick_list_values ?? []).map((v) => ({
     id: v.id,
@@ -144,7 +152,7 @@ async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
     forecast_category_name: v.forecast_category?.name ?? "Pipeline",
   }));
   // P12: Deals custom-field index for teardown of Deal-module fields.
-  const fields_deals = dealFieldList.filter((f) => !!f.api_name).map((f) => ({ id: f.id, api_name: f.api_name }));
+  const fields_deals = dealFieldList.filter((f) => !!f.api_name).map((f) => ({ id: f.id, api_name: f.api_name, data_type: f.data_type ?? null, length: f.length ?? null }));
 
   const layouts = await zoho(conn, "/crm/v8/settings/layouts?module=Deals");
   const default_deals_layout_id = (((layouts.body as { layouts?: Array<{ id: string; status: string }> })?.layouts) ?? [])
@@ -178,13 +186,36 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
   let seq = 1;
 
   for (const f of spec.fields) {
-    const existing = snap.fields_lead.find((x) => x.api_name === f.api_name);
+    const moduleApi = f.module === "Lead" ? "Leads" : f.module === "Deal" ? "Deals" : f.module;
+    const list = moduleApi === "Deals" ? snap.fields_deals : snap.fields_lead;
+    const existing = list.find((x) => x.api_name === f.api_name);
+    let diff: PlanStep["diff"] = "create";
+    if (existing) {
+      if (f.adopt_if_exists === false) {
+        throw new DataError({
+          message: `field ${moduleApi}.${f.api_name} already exists but adopt_if_exists=false — refusing to recreate. Set adopt_if_exists=true to attach, or remove it from the delta.`,
+          vendorCode: "FIELD_EXISTS_NO_ADOPT",
+        });
+      }
+      // P20: shape-compatibility. Zoho's data_type matches kindToZohoType's vocabulary
+      // directly. Unknown shape → adopt conservatively (never recreate an existing field).
+      const wantType = kindToZohoType(f.kind);
+      const lengthOk = !(f.kind === "text" && f.length != null && existing.length != null && existing.length < f.length);
+      const compatible = existing.data_type == null ? true : (existing.data_type === wantType && lengthOk);
+      if (!compatible) {
+        throw new DataError({
+          message: `field ${moduleApi}.${f.api_name} exists with data_type='${existing.data_type}'${existing.length != null ? ` length=${existing.length}` : ""} but the spec wants '${wantType}'${f.length != null ? ` length=${f.length}` : ""}. Cannot adopt an incompatible field — rename the spec field or align its kind/length.`,
+          vendorCode: "SHAPE_CONFLICT",
+        });
+      }
+      diff = "adopt";
+    }
     steps.push({
       seq: seq++,
       operation: "create_field",
       target: f.module,
       payload: f as FieldPayload,
-      diff: existing ? "noop" : "create",
+      diff,
       destructive: false,
     });
   }
@@ -219,7 +250,7 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
     const supported = isWorkflowSupported(w.shape);
     const manual = isWorkflowManual(w.shape);
     let notes: string | undefined;
-    if (manual) notes = `Zoho: ${w.shape} requires a Deluge function (functions are UI-only). See docs/surfaces/zoho-deluge-patterns.md for the canonical script — paste once in Setup > Developer Hub > Functions, then re-run plan with the function ID referenced.`;
+    if (manual) notes = `Zoho: ${w.shape} needs a Deluge function. Functions ARE REST-creatable (POST /crm/v8/settings/functions, admin-authorized connection required) but the adapter does not yet wire creation. Until then, create it once via Setup > Developer Hub > Functions using the canonical script in docs/surfaces/zoho-deluge-patterns.md, then reference the function ID in a workflow rule.`;
     else if (!supported) notes = `Zoho v8: ${w.shape} unsupported by adapter.`;
     steps.push({
       seq: seq++,
@@ -585,6 +616,12 @@ export const zohoAdapter: Adapter = {
     for (const step of reverse) {
       try {
         if (step.operation === "create_field") {
+          // P20: never delete a field we merely adopted — it pre-existed and isn't ours.
+          if ((step.result as { provenance?: string } | null)?.provenance === "adopted") {
+            const r: StepResult = { seq: step.seq, status: "succeeded", result: { skipped_adopted_not_owned: true, note: "field pre-existed and was adopted, not created — left intact" } };
+            results.push(r); onStep(r);
+            continue;
+          }
           const f = step.payload as FieldPayload;
           const moduleApi = f.module === "Lead" ? "Leads" : f.module === "Deal" ? "Deals" : f.module;
           // P12: per-module field index, no second snapshot fetch.

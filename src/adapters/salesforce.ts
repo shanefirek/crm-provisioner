@@ -12,7 +12,7 @@
 // - Profile permissions beyond the run's permset
 
 import type { ProvisionSpec, StageSpec, WorkflowShape } from "../core/spec.ts";
-import { BoundaryError, classifySfdcResponse, describeThrown, retryBoundary } from "../host/errors.ts";
+import { BoundaryError, classifySfdcResponse, DataError, describeThrown, retryBoundary } from "../host/errors.ts";
 import { runApplyLoop } from "./lifecycle.ts";
 import type {
   Adapter,
@@ -109,7 +109,9 @@ async function sf(conn: ConnectionContext, path: string, init: SfFetchInit = {})
 // --- Snapshot --------------------------------------------------------------
 
 type Snapshot = {
-  fields_lead: Array<{ FullName: string; DeveloperName: string }>;
+  // P20: dataType/length carry the field's shape for adopt-or-create compatibility.
+  // Null when FieldDefinition didn't return shape for a field (treated as unknown → adopt).
+  fields_lead: Array<{ FullName: string; DeveloperName: string; dataType: string | null; length: number | null }>;
   stages: Array<{ ApiName: string; IsActive: boolean; DefaultProbability: number }>;
   flows: Array<{ DeveloperName: string }>;
   assignment_rule_names: string[];
@@ -137,8 +139,21 @@ async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
   const fieldsResp = await sf(conn, `/services/data/v62.0/tooling/query?q=${encodeURIComponent(
     "SELECT Id, DeveloperName FROM CustomField WHERE TableEnumOrId = 'Lead'",
   )}`);
+  // P20: field shape (DataType + Length) for adopt-or-create compatibility. FieldDefinition
+  // is a regular Data-API sObject (NOT Tooling) and must be filtered by EntityDefinition.
+  // Returns standard + custom fields; we index by QualifiedApiName (custom = `Foo__c`).
+  const shapeByApi = new Map<string, { dataType: string; length: number | null }>();
+  const shapeResp = await sf(conn, `/services/data/v62.0/query?q=${encodeURIComponent(
+    "SELECT QualifiedApiName, DataType, Length FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = 'Lead'",
+  )}`);
+  for (const r of (((shapeResp.body as { records?: Array<{ QualifiedApiName: string; DataType: string | null; Length: number | null }> })?.records) ?? [])) {
+    shapeByApi.set(r.QualifiedApiName, { dataType: r.DataType ?? "", length: r.Length ?? null });
+  }
   const fields_lead = (((fieldsResp.body as { records?: Array<{ Id: string; DeveloperName: string }> })?.records) ?? [])
-    .map((r) => ({ FullName: `Lead.${r.DeveloperName}__c`, DeveloperName: r.DeveloperName }));
+    .map((r) => {
+      const shape = shapeByApi.get(`${r.DeveloperName}__c`);
+      return { FullName: `Lead.${r.DeveloperName}__c`, DeveloperName: r.DeveloperName, dataType: shape?.dataType ?? null, length: shape?.length ?? null };
+    });
   // Flows — Tooling
   const flowResp = await sf(conn, `/services/data/v62.0/tooling/query?q=${encodeURIComponent(
     "SELECT DeveloperName FROM FlowDefinitionView",
@@ -177,13 +192,35 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
   let seq = 1;
 
   for (const f of spec.fields) {
-    const exists = snap.fields_lead.some((x) => x.DeveloperName === f.api_name && (f.module === "Lead" || f.module === "Leads"));
+    const existing = snap.fields_lead.find((x) => x.DeveloperName === f.api_name && (f.module === "Lead" || f.module === "Leads"));
+    let diff: PlanStep["diff"] = "create";
+    if (existing) {
+      if (f.adopt_if_exists === false) {
+        throw new DataError({
+          message: `field Lead.${f.api_name}__c already exists but adopt_if_exists=false — refusing to recreate. Set adopt_if_exists=true to attach, or remove it from the delta.`,
+          vendorCode: "FIELD_EXISTS_NO_ADOPT",
+        });
+      }
+      // P20: shape-compatibility. Unknown shape (FieldDefinition returned nothing) → adopt
+      // conservatively (can't prove incompatibility; never recreate an existing field).
+      const existingFamily = existing.dataType ? sfTypeFamily(existing.dataType) : null;
+      const wantFamily = kindToSfType(f.kind);
+      const lengthOk = !(f.kind === "text" && f.length != null && existing.length != null && existing.length < f.length);
+      const compatible = existingFamily == null ? true : (existingFamily === wantFamily && lengthOk);
+      if (!compatible) {
+        throw new DataError({
+          message: `field Lead.${f.api_name}__c exists as '${existing.dataType}'${existing.length != null ? ` length=${existing.length}` : ""} but the spec wants ${wantFamily}${f.length != null ? ` length=${f.length}` : ""}. Cannot adopt an incompatible field — rename the spec field or align its kind/length.`,
+          vendorCode: "SHAPE_CONFLICT",
+        });
+      }
+      diff = "adopt";
+    }
     steps.push({
       seq: seq++,
       operation: "create_field",
       target: f.module,
       payload: f as FieldPayload,
-      diff: exists ? "noop" : "create",
+      diff,
       destructive: false,
     });
   }
@@ -282,6 +319,25 @@ async function createField(conn: ConnectionContext, f: FieldPayload): Promise<un
     throw classifySfdcResponse({ status, body });
   }
   return body;
+}
+
+// P20: map a FieldDefinition.DataType display string (e.g. "Text(80)", "Number(18, 0)",
+// "Date/Time", "Long Text Area(32768)") back to the same type family kindToSfType emits,
+// so the two can be compared for adopt-compatibility.
+function sfTypeFamily(dataTypeDisplay: string): string {
+  const d = dataTypeDisplay.trim().toLowerCase();
+  if (d.startsWith("long text")) return "LongTextArea";
+  if (d.startsWith("text")) return "Text";
+  if (d.startsWith("number") || d.startsWith("currency") || d.startsWith("percent")) return "Number";
+  if (d.startsWith("checkbox")) return "Checkbox";
+  if (d.startsWith("date/time")) return "DateTime";
+  if (d.startsWith("date")) return "Date";
+  if (d.startsWith("picklist")) return "Picklist";
+  if (d.startsWith("email")) return "Email";
+  if (d.startsWith("phone")) return "Phone";
+  if (d.startsWith("url")) return "Url";
+  if (d.startsWith("lookup")) return "Lookup";
+  return dataTypeDisplay.trim();
 }
 
 function kindToSfType(kind: string): string {
@@ -685,6 +741,10 @@ export const salesforceAdapter: Adapter = {
           const succeededFields = new Set<string>();
           for (const s of plan.steps) {
             if (s.operation !== "create_field") continue;
+            // P20: an adopted field pre-existed in the customer's org — it is not ours to
+            // grant FLS on through our permset (and must not be revoked on teardown). Only
+            // fields we actually create flow through here.
+            if (s.diff === "adopt") continue;
             const r = priorResults.find((x) => x.seq === s.seq);
             const succeeded = r?.status === "succeeded" || s.diff === "noop";
             if (succeeded) {
@@ -694,14 +754,15 @@ export const salesforceAdapter: Adapter = {
           }
           const filteredFields = payload.fields.filter((fn) => succeededFields.has(fn));
           if (filteredFields.length === 0) {
-            return { permset: payload.permset, fields_granted: 0, note: "no fields to grant — all create_field steps failed or were skipped this run" };
+            return { permset: payload.permset, fields_granted: 0, granted_fields: [], note: "no fields to grant — all create_field steps failed, were skipped, or adopted this run" };
           }
           await retryBoundary(() => deployPermissionSet(conn, payload.permset, filteredFields));
           await retryBoundary(() => assignPermissionSet(conn, payload.permset));
           const skipped = payload.fields.length - filteredFields.length;
+          // Record the exact fields granted so teardown revokes precisely these — never an adopted field.
           return skipped > 0
-            ? { permset: payload.permset, fields_granted: filteredFields.length, fields_skipped_due_to_create_failure: skipped }
-            : { permset: payload.permset, fields_granted: filteredFields.length };
+            ? { permset: payload.permset, fields_granted: filteredFields.length, granted_fields: filteredFields, fields_skipped_due_to_create_failure: skipped }
+            : { permset: payload.permset, fields_granted: filteredFields.length, granted_fields: filteredFields };
         }
         if (step.operation.startsWith("create_workflow:")) {
           await retryBoundary(() => deployFlow(conn, step.payload as WorkflowPayload));
@@ -725,6 +786,13 @@ export const salesforceAdapter: Adapter = {
     for (const step of reverse) {
       try {
         if (step.operation === "create_field") {
+          // P20: never delete a field we merely adopted — it pre-existed in the customer's
+          // org and isn't ours to destroy. provenance lives in the stored step result.
+          if ((step.result as { provenance?: string } | null)?.provenance === "adopted") {
+            const r: StepResult = { seq: step.seq, status: "succeeded", result: { skipped_adopted_not_owned: true, note: "field pre-existed and was adopted, not created — left intact" } };
+            results.push(r); onStep(r);
+            continue;
+          }
           // Canonical SFDC field removal = destructiveChanges deploy. Tooling DELETE
           // trips FLS / dependency permission walls; destructive deploy uses metadata-
           // layer auth and handles those concerns.
@@ -740,18 +808,23 @@ export const salesforceAdapter: Adapter = {
           // would have zero field entries, the redeploy still succeeds — empty permset
           // is valid SFDC metadata.
           const payload = step.payload as { permset: string; fields: string[] };
+          // P20: revoke FLS only for the fields THIS run actually granted (created fields).
+          // Newer runs store the exact granted list; older runs fall back to payload.fields.
+          // An adopted pre-existing field is never in granted_fields, so its FLS grant is
+          // left intact — same blast-radius guard as the create_field teardown above.
+          const grantedThisRun = (step.result as { granted_fields?: string[] } | null)?.granted_fields ?? payload.fields;
           const existingResp = await sf(conn, `/services/data/v62.0/query?q=${encodeURIComponent(
             `SELECT Field, PermissionsRead, PermissionsEdit FROM FieldPermissions WHERE Parent.Name = '${payload.permset}'`,
           )}`);
           const existing = (((existingResp.body as { records?: Array<{ Field: string; PermissionsRead: boolean; PermissionsEdit: boolean }> })?.records) ?? []);
-          const removeSet = new Set(payload.fields);
+          const removeSet = new Set(grantedThisRun);
           const keep = existing.filter((e) => !removeSet.has(e.Field));
           // Re-deploy with just the remaining fields (or empty if none). deployPermissionSet
           // does a fresh read inside, but since we pass [] for new fields it will reconcile
           // against current state — to actually REMOVE entries we have to bypass the helper
           // and write the redacted XML directly.
           await redeployPermissionSetExact(conn, payload.permset, keep.map((e) => ({ field: e.Field, read: !!e.PermissionsRead, edit: !!e.PermissionsEdit })));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "grant_field_visibility", fields_removed: payload.fields.length, fields_remaining: keep.length } };
+          const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "grant_field_visibility", fields_removed: removeSet.size, fields_remaining: keep.length } };
           results.push(r); onStep(r);
         } else {
           // Stage deactivate-not-delete (the S0 catch) — we just record as reversed but the
