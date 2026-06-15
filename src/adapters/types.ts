@@ -20,7 +20,12 @@ export type PlanStep = {
   operation: string;                  // 'create_field' | 'add_stage' | 'create_pipeline' | 'create_workflow:idle_deal_alert' | ...
   target?: string;                    // module / object label
   payload: unknown;                   // adapter-specific shape that apply() will execute
-  diff: "create" | "update" | "noop" | "unsupported" | "blocked_by_prior_failure";
+  // P20: "adopt" = a field with the target api_name already exists on the module with a
+  // compatible shape; we attach to it instead of creating. Distinct from "noop" so the
+  // human confirming the plan SEES they're binding to a pre-existing asset (ai-output
+  // tier-4), and so apply can record provenance:"adopted" — which teardown reads to
+  // guarantee it never deletes a field it merely adopted.
+  diff: "create" | "update" | "noop" | "adopt" | "unsupported" | "blocked_by_prior_failure";
   destructive: boolean;               // true when the reverse-op is lossy (deactivates-not-deletes, deletes a stage that has records, etc.)
   notes?: string;                     // e.g. "marked unsupported by capability map: assignment_rules"
 };

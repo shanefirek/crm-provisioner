@@ -30,6 +30,11 @@ export const FieldSpecSchema = z.object({
   description: z.string().optional(),
   picklist_values: z.array(z.string()).optional(), // when kind=picklist
   required: z.boolean().optional(),
+  // P20: when a field with this api_name already exists on the module, attach to it
+  // (diff="adopt") instead of erroring/recreating — provided its shape is compatible.
+  // Omitted = adopt (the common case for a customer with a pre-configured CRM). Set
+  // false to force create-only (existing field of the same name becomes a hard conflict).
+  adopt_if_exists: z.boolean().optional(),
 });
 export type FieldSpec = z.infer<typeof FieldSpecSchema>;
 

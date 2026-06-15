@@ -229,6 +229,60 @@ R=$(mcp_call 18 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"
 TD_OF=$(echo "$R" | field_of run.teardown_of_run)
 [ "$TD_OF" = "$RUN" ] && pass "teardown run's teardown_of_run links to original" || fail "teardown_of_run link" "got '$TD_OF' expected '$RUN'"
 
+# ---- P20: adopt-or-create on fields (memory adapter) ----
+# Proves the four must-haves on the stub adapter (no live CRM): diff="adopt" surfaced,
+# provenance="adopted" recorded, teardown LEAVES an adopted field intact, and a
+# shape-mismatch / adopt_if_exists=false case yields an instructive reject (not a noop).
+echo "== P20: adopt-or-create (memory adapter) =="
+R=$(mcp_call 700 'tools/call' '{"name":"connect_crm","arguments":{"crm":"memory","org_label":"p20-adopt","is_demo":true,"api_domain":"memory://p20","writable_org_ids":["memory://p20"]}}' | text_of)
+CONN20=$(echo "$R" | field_of connection_id)
+[ -n "$CONN20" ] && pass "P20: got adopt-test connection" || fail "P20 connection" "empty"
+
+# toy-sales has fields:[] so the only create_field step is ours.
+P20_FIELD='{"spec_version":0,"fields":[{"api_name":"Adopt_Probe","label":"Adopt Probe","kind":"text","module":"Lead","length":80}],"stages":[],"pipelines":[],"workflows":[]}'
+
+# 1. First plan+apply CREATES the field (provenance=created).
+R=$(mcp_call 701 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN20\",\"template_ref\":\"toy-sales\",\"delta\":$P20_FIELD}}" | text_of)
+P20_PLAN=$(echo "$R" | field_of plan_id)
+CREATE_DIFF=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));const s=(d.steps||[]).find(x=>x.operation==='create_field');process.stdout.write(s?s.diff:'')")
+[ "$CREATE_DIFF" = "create" ] && pass "P20: first plan diff=create for new field" || fail "P20 first plan diff" "got '$CREATE_DIFF'"
+R=$(mcp_call 702 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P20_PLAN\"}}" | text_of)
+RUN_CREATE=$(echo "$R" | field_of run_id)
+[ -n "$RUN_CREATE" ] && pass "P20: create-run applied" || fail "P20 create-run" "$R"
+
+# 2. Re-plan the SAME field on the SAME state → diff=adopt (was noop pre-P20).
+R=$(mcp_call 703 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN20\",\"template_ref\":\"toy-sales\",\"delta\":$P20_FIELD}}" | text_of)
+P20_PLAN2=$(echo "$R" | field_of plan_id)
+ADOPT_DIFF=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));const s=(d.steps||[]).find(x=>x.operation==='create_field');process.stdout.write(s?s.diff:'')")
+[ "$ADOPT_DIFF" = "adopt" ] && pass "P20: re-plan diff=adopt for existing compatible field" || fail "P20 adopt diff" "got '$ADOPT_DIFF'"
+
+# 3. Apply the adopt; the step records provenance=adopted (read back via get_run result_json).
+R=$(mcp_call 704 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$P20_PLAN2\"}}" | text_of)
+RUN_ADOPT=$(echo "$R" | field_of run_id)
+[ -n "$RUN_ADOPT" ] && pass "P20: adopt-run applied" || fail "P20 adopt-run" "$R"
+R=$(mcp_call 705 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$RUN_ADOPT\"}}" | text_of)
+PROV=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));const s=(d.steps||[]).find(x=>x.operation==='create_field');process.stdout.write(s&&s.result_json?String(s.result_json.provenance):'')")
+[ "$PROV" = "adopted" ] && pass "P20: adopt-run step recorded provenance=adopted" || fail "P20 provenance=adopted" "got '$PROV'"
+
+# 4. Teardown the ADOPT run → the adopted field SURVIVES (we never delete what we adopted).
+R=$(mcp_call 706 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$RUN_ADOPT\"}}" | text_of)
+[ "$(echo "$R" | field_of ok)" = "true" ] && pass "P20: teardown of adopt-run ok" || fail "P20 teardown ok" "$R"
+R=$(mcp_call 707 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$CONN20\"}}" | text_of)
+SURVIVES=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));process.stdout.write((d.snapshot&&d.snapshot.fields||[]).some(f=>f.api_name==='Adopt_Probe')?'yes':'no')")
+[ "$SURVIVES" = "yes" ] && pass "P20: teardown of adopt-run LEFT the adopted field intact" || fail "P20 adopt field survives teardown" "got '$SURVIVES'"
+
+# 5. Shape mismatch (text → number) → instructive SHAPE_CONFLICT, not a silent noop.
+P20_MISMATCH='{"spec_version":0,"fields":[{"api_name":"Adopt_Probe","label":"Adopt Probe","kind":"number","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+R=$(mcp_call 708 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN20\",\"template_ref\":\"toy-sales\",\"delta\":$P20_MISMATCH}}" | text_of)
+MM_OK=$(echo "$R" | field_of ok); MM_ERR=$(echo "$R" | field_of error)
+{ [ "$MM_OK" = "false" ] && [ "$MM_ERR" = "SHAPE_CONFLICT" ]; } && pass "P20: shape-mismatch field rejected with instructive SHAPE_CONFLICT" || fail "P20 shape conflict" "ok=$MM_OK err=$MM_ERR | $R"
+
+# 6. adopt_if_exists=false on an existing field → FIELD_EXISTS_NO_ADOPT.
+P20_NOADOPT='{"spec_version":0,"fields":[{"api_name":"Adopt_Probe","label":"Adopt Probe","kind":"text","module":"Lead","length":80,"adopt_if_exists":false}],"stages":[],"pipelines":[],"workflows":[]}'
+R=$(mcp_call 709 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$CONN20\",\"template_ref\":\"toy-sales\",\"delta\":$P20_NOADOPT}}" | text_of)
+NA_ERR=$(echo "$R" | field_of error)
+[ "$NA_ERR" = "FIELD_EXISTS_NO_ADOPT" ] && pass "P20: adopt_if_exists=false on existing field → FIELD_EXISTS_NO_ADOPT" || fail "P20 no-adopt flag" "err=$NA_ERR | $R"
+
 # ---- P5: retry-with-backoff via synthetic memory throws ----
 # Three test cases probing the retry decision matrix:
 #  (a) BoundaryError:transient → retried up to maxAttempts (5), then fails
@@ -846,14 +900,16 @@ process.stdout.write(r.PermissionsRead && r.PermissionsEdit ? 'read-edit' : ('pa
     echo "    (SF_PROBER_ALIAS not set — primary FieldPermissions gate above is the live check; strong-gate prober probe skipped.)"
   fi
 
-  # Idempotency: a second plan should diff to noop on the field
+  # P20: a second plan on the now-existing field diffs to ADOPT (was noop pre-P20).
+  # The field's live shape (Text(80)) is compatible with the spec, so we attach to it.
   R=$(mcp_call 55 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$SF_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$SF_DELTA}}" | text_of)
-  NOOP_FIELD=$(echo "$R" | node -e "
+  SF_ADOPT_PLAN=$(echo "$R" | field_of plan_id)
+  ADOPT_FIELD=$(echo "$R" | node -e "
 const d=JSON.parse(require('fs').readFileSync(0));
 const s=(d.steps||[]).find(x=>x.operation==='create_field' && x.payload?.api_name==='prov_smoke_field');
 process.stdout.write(s?.diff || 'missing');
 ")
-  [ "$NOOP_FIELD" = "noop" ] && pass "live: second plan shows noop on existing field (idempotent)" || fail "idempotent re-plan" "got '$NOOP_FIELD'"
+  [ "$ADOPT_FIELD" = "adopt" ] && pass "P20 live: second plan shows ADOPT on existing compatible field" || fail "P20 live adopt diff" "got '$ADOPT_FIELD'"
 
   # P9 idempotency: the grant_field_visibility step ALSO noops on re-plan, because the
   # FieldPermissions row was created on the first apply (snapshot.permset_field_perms
@@ -865,7 +921,29 @@ process.stdout.write(s?.diff || 'missing');
 ")
   [ "$NOOP_GRANT" = "noop" ] && pass "P9: second plan shows noop on grant_field_visibility (idempotent FLS)" || fail "P9 idempotent FLS re-plan" "got '$NOOP_GRANT'"
 
-  # Teardown — verify the field is removed
+  # P20: plan the same field name as an INCOMPATIBLE kind (number vs the live Text) →
+  # instructive SHAPE_CONFLICT, proving the live FieldDefinition shape-source drives the check.
+  SF_MM='{"spec_version":0,"fields":[{"api_name":"prov_smoke_field","label":"prov_smoke_field","kind":"number","module":"Lead"}],"stages":[],"pipelines":[],"workflows":[]}'
+  R=$(mcp_call 555 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$SF_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$SF_MM}}" | text_of)
+  SF_MM_ERR=$(echo "$R" | field_of error)
+  [ "$SF_MM_ERR" = "SHAPE_CONFLICT" ] && pass "P20 live: incompatible-kind field rejected with SHAPE_CONFLICT" || fail "P20 live shape conflict" "got error='$SF_MM_ERR' | $R"
+
+  # P20 SAFETY GATE: apply the adopt plan, then tear THAT run down. Because the field was
+  # adopted (provenance=adopted), teardown must NOT delete it — it isn't ours. This is the
+  # nightmare-scenario guard: we never destroy a customer's pre-existing field.
+  R=$(mcp_call 551 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$SF_ADOPT_PLAN\"}}" | text_of)
+  SF_ADOPT_RUN=$(echo "$R" | field_of run_id)
+  [ -n "$SF_ADOPT_RUN" ] && pass "P20 live: adopt-run applied" || fail "P20 live adopt-run" "$R"
+  R=$(mcp_call 552 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$SF_ADOPT_RUN\"}}" | text_of)
+  SF_PROV=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));const s=(d.steps||[]).find(x=>x.operation==='create_field');process.stdout.write(s&&s.result_json?String(s.result_json.provenance):'')")
+  [ "$SF_PROV" = "adopted" ] && pass "P20 live: adopt-run create_field recorded provenance=adopted" || fail "P20 live provenance" "got '$SF_PROV'"
+  R=$(mcp_call 553 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$SF_ADOPT_RUN\"}}" | text_of)
+  [ "$(echo "$R" | field_of status)" = "succeeded" ] && pass "P20 live: teardown of adopt-run ok" || fail "P20 live teardown adopt-run" "$R"
+  R=$(mcp_call 554 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$SF_CONN\"}}" | text_of)
+  SF_SURVIVES=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));process.stdout.write((d.snapshot&&d.snapshot.fields_lead||[]).some(x=>x.DeveloperName==='prov_smoke_field')?'yes':'no')")
+  [ "$SF_SURVIVES" = "yes" ] && pass "P20 live: teardown of adopt-run LEFT the field intact (not ours to delete)" || fail "P20 live adopt field survives" "got '$SF_SURVIVES'"
+
+  # Teardown the ORIGINAL create-run (provenance=created) — verify the field IS removed.
   R=$(mcp_call 56 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$SF_RUN\"}}" | text_of)
   TD_STATUS=$(echo "$R" | field_of status)
   [ "$TD_STATUS" = "succeeded" ] && pass "live teardown succeeded" || fail "live teardown" "$R"
@@ -980,16 +1058,36 @@ process.stdout.write((d.snapshot?.fields_lead||[]).find(x=>x.api_name==='prov_zo
 ")
   [ "$FOUND" = "yes" ] && pass "live Zoho: probe field exists" || fail "Zoho field exists" "got $FOUND"
 
-  # idempotent re-plan
+  # P20: re-plan the now-existing field → diff=ADOPT (was noop pre-P20).
   R=$(mcp_call 65 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$Z_DELTA}}" | text_of)
-  Z_NOOP=$(echo "$R" | node -e "
+  Z_ADOPT_PLAN=$(echo "$R" | field_of plan_id)
+  Z_ADOPT=$(echo "$R" | node -e "
 const d=JSON.parse(require('fs').readFileSync(0));
 const s=(d.steps||[]).find(x=>x.operation==='create_field' && x.payload?.api_name==='prov_zoho_smoke');
 process.stdout.write(s?.diff || 'missing');
 ")
-  [ "$Z_NOOP" = "noop" ] && pass "live Zoho: idempotent re-plan = noop on field" || fail "Zoho idempotent" "got '$Z_NOOP'"
+  [ "$Z_ADOPT" = "adopt" ] && pass "P20 live Zoho: re-plan shows ADOPT on existing compatible field" || fail "P20 Zoho adopt diff" "got '$Z_ADOPT'"
 
-  # teardown
+  # P20: incompatible kind (number vs live text) → instructive SHAPE_CONFLICT.
+  Z_MM='{"spec_version":0,"fields":[{"api_name":"prov_zoho_smoke","label":"Prov Zoho Smoke","kind":"number","module":"Leads"}],"stages":[],"pipelines":[],"workflows":[]}'
+  R=$(mcp_call 651 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$Z_MM}}" | text_of)
+  Z_MM_ERR=$(echo "$R" | field_of error)
+  [ "$Z_MM_ERR" = "SHAPE_CONFLICT" ] && pass "P20 live Zoho: incompatible-kind field rejected with SHAPE_CONFLICT" || fail "P20 Zoho shape conflict" "got error='$Z_MM_ERR' | $R"
+
+  # P20 SAFETY GATE: apply the adopt plan, tear THAT run down → field must SURVIVE (adopted, not ours).
+  R=$(mcp_call 652 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$Z_ADOPT_PLAN\"}}" | text_of)
+  Z_ADOPT_RUN=$(echo "$R" | field_of run_id)
+  [ -n "$Z_ADOPT_RUN" ] && pass "P20 live Zoho: adopt-run applied" || fail "P20 Zoho adopt-run" "$R"
+  R=$(mcp_call 653 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$Z_ADOPT_RUN\"}}" | text_of)
+  Z_PROV=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));const s=(d.steps||[]).find(x=>x.operation==='create_field');process.stdout.write(s&&s.result_json?String(s.result_json.provenance):'')")
+  [ "$Z_PROV" = "adopted" ] && pass "P20 live Zoho: adopt-run recorded provenance=adopted" || fail "P20 Zoho provenance" "got '$Z_PROV'"
+  R=$(mcp_call 654 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$Z_ADOPT_RUN\"}}" | text_of)
+  [ "$(echo "$R" | field_of status)" = "succeeded" ] && pass "P20 live Zoho: teardown of adopt-run ok" || fail "P20 Zoho teardown adopt-run" "$R"
+  R=$(mcp_call 655 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$Z_CONN\"}}" | text_of)
+  Z_SURVIVES=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));process.stdout.write((d.snapshot&&d.snapshot.fields_lead||[]).some(x=>x.api_name==='prov_zoho_smoke')?'yes':'no')")
+  [ "$Z_SURVIVES" = "yes" ] && pass "P20 live Zoho: teardown of adopt-run LEFT the field intact" || fail "P20 Zoho adopt field survives" "got '$Z_SURVIVES'"
+
+  # teardown the ORIGINAL create-run (provenance=created) → field IS removed.
   R=$(mcp_call 66 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$Z_RUN\"}}" | text_of)
   Z_TD_STATUS=$(echo "$R" | field_of status)
   [ "$Z_TD_STATUS" = "succeeded" ] && pass "live Zoho teardown succeeded" || fail "Zoho teardown" "$R"

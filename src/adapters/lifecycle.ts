@@ -121,6 +121,15 @@ export async function runApplyLoop(
       onStep(r);
       continue;
     }
+    // P20: adopt — the asset already exists with a compatible shape. No write; record
+    // provenance:"adopted" so teardown knows this asset pre-existed and must NOT be
+    // deleted (it isn't ours). No vendor call, so no shouldAbort check needed.
+    if (step.diff === "adopt") {
+      const r: StepResult = { seq: step.seq, status: "succeeded", result: { adopted: true, provenance: "adopted" } };
+      results.push(r);
+      onStep(r);
+      continue;
+    }
     if (step.diff === "unsupported") {
       const r: StepResult = { seq: step.seq, status: "skipped_unsupported", result: { reason: step.notes } };
       results.push(r);
@@ -137,7 +146,13 @@ export async function runApplyLoop(
     // Real dispatch path — adapter handles vendor call.
     try {
       const result = await hooks.dispatch(step, results);
-      const r: StepResult = { seq: step.seq, status: "succeeded", result };
+      // P20: stamp provenance:"created" on a freshly-created field so teardown can tell
+      // it apart from an adopted (pre-existing) field. Only create_field carries the
+      // created/adopted distinction; other ops are reversed by their own teardown rules.
+      const stamped = step.operation === "create_field" && result && typeof result === "object" && !Array.isArray(result)
+        ? { ...(result as Record<string, unknown>), provenance: "created" }
+        : result;
+      const r: StepResult = { seq: step.seq, status: "succeeded", result: stamped };
       results.push(r);
       onStep(r);
     } catch (e) {

@@ -10,6 +10,7 @@ import { applyOverlay } from "../core/overlay.ts";
 import { DeltaSpecSchema, ProvisionSpecSchema, type ProvisionSpec } from "../core/spec.ts";
 import { getTemplate, listTemplates } from "../core/templates.ts";
 import { db } from "./db.ts";
+import { DataError } from "./errors.ts";
 import {
   annotateBlockedSteps,
   clearForReversed,
@@ -223,7 +224,7 @@ export function buildMcpServer(): McpServer {
     "plan",
     {
       description:
-        "Validate (template + delta), inspect the live CRM, and compute the diff per step: 'create' | 'update' | 'noop' | 'unsupported'. Each step also carries `destructive: bool` (true when reverse is lossy — e.g. SFDC stage deactivate-not-delete) and optional `notes` (e.g. round_robin_assignment in Zoho is 'manual' — note tells the human to paste the canonical Deluge script once in UI). Output includes `unsupported_count` and `destructive_count`. Returns a plan_id (single-use, in-process cache only — re-plan if the server restarts). Nothing is written. Per-CRM adapter knowledge the model should KNOW when authoring deltas: SFDC fields require a paired permset for FLS (handled automatically by the adapter); SFDC stages deactivate-not-delete (residue persists); Zoho fields are visible-by-default; Zoho stages use whole-array-replace semantics (adapter handles the merge); Zoho underscores in stage api_names normalize to spaces (Lead_In → Lead In, adapter normalizes lookups). Workflow shapes: idle_deal_alert (SFDC Flow + Zoho workflow_rule+task; both create supported) / field_derivation (both supported) / round_robin_assignment (SFDC stub Flow, Zoho MANUAL with Deluge instructions in the note).",
+        "Validate (template + delta), inspect the live CRM, and compute the diff per step: 'create' | 'update' | 'noop' | 'unsupported'. Each step also carries `destructive: bool` (true when reverse is lossy — e.g. SFDC stage deactivate-not-delete) and optional `notes` (e.g. round_robin_assignment in Zoho is 'manual' because the adapter does not yet wire Deluge-function creation — note tells the human to create it once; Deluge functions ARE REST-creatable via an admin-authorized connection). Output includes `unsupported_count` and `destructive_count`. Returns a plan_id (single-use, in-process cache only — re-plan if the server restarts). Nothing is written. Per-CRM adapter knowledge the model should KNOW when authoring deltas: SFDC fields require a paired permset for FLS (handled automatically by the adapter); SFDC stages deactivate-not-delete (residue persists); Zoho fields are visible-by-default; Zoho stages use whole-array-replace semantics (adapter handles the merge); Zoho underscores in stage api_names normalize to spaces (Lead_In → Lead In, adapter normalizes lookups). Workflow shapes: idle_deal_alert (SFDC Flow + Zoho workflow_rule+task; both create supported) / field_derivation (both supported) / round_robin_assignment (SFDC stub Flow; Zoho currently manual — Deluge-function creation is REST-capable but not yet wired in the adapter).",
       inputSchema: {
         connection_id: z.string(),
         template_ref: z.string(),
@@ -237,7 +238,19 @@ export function buildMcpServer(): McpServer {
       if (!conn) return ok(JSON.stringify({ ok: false, error: "CONNECTION_NOT_FOUND", connection_id }));
       const adapter = adapterFor(conn.crm);
       const { snapshot } = await adapter.inspect(conn);
-      const plan = await adapter.plan(conn, validated.spec, snapshot);
+      // P20: adopt-or-create — the adapter throws a DataError when a spec field collides
+      // with an existing field of an incompatible shape (or when adopt_if_exists=false).
+      // Surface it as an instructive ok=false so the agent re-authors the delta, mirroring
+      // the validate_spec failure path — rather than letting it bubble as a transport error.
+      let plan: Plan;
+      try {
+        plan = await adapter.plan(conn, validated.spec, snapshot);
+      } catch (e) {
+        if (e instanceof DataError) {
+          return ok(JSON.stringify({ ok: false, error: e.vendorCode ?? "DATA_ERROR", message: e.message }, null, 2));
+        }
+        throw e;
+      }
       plan.spec_hash = validated.spec_hash;
       // P6: annotate steps blocked by prior permanent failures BEFORE re-deriving counts.
       const blocked_count = await annotateBlockedSteps(db, conn.id, plan);
