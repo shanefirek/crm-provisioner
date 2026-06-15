@@ -741,6 +741,10 @@ export const salesforceAdapter: Adapter = {
           const succeededFields = new Set<string>();
           for (const s of plan.steps) {
             if (s.operation !== "create_field") continue;
+            // P20: an adopted field pre-existed in the customer's org — it is not ours to
+            // grant FLS on through our permset (and must not be revoked on teardown). Only
+            // fields we actually create flow through here.
+            if (s.diff === "adopt") continue;
             const r = priorResults.find((x) => x.seq === s.seq);
             const succeeded = r?.status === "succeeded" || s.diff === "noop";
             if (succeeded) {
@@ -750,14 +754,15 @@ export const salesforceAdapter: Adapter = {
           }
           const filteredFields = payload.fields.filter((fn) => succeededFields.has(fn));
           if (filteredFields.length === 0) {
-            return { permset: payload.permset, fields_granted: 0, note: "no fields to grant — all create_field steps failed or were skipped this run" };
+            return { permset: payload.permset, fields_granted: 0, granted_fields: [], note: "no fields to grant — all create_field steps failed, were skipped, or adopted this run" };
           }
           await retryBoundary(() => deployPermissionSet(conn, payload.permset, filteredFields));
           await retryBoundary(() => assignPermissionSet(conn, payload.permset));
           const skipped = payload.fields.length - filteredFields.length;
+          // Record the exact fields granted so teardown revokes precisely these — never an adopted field.
           return skipped > 0
-            ? { permset: payload.permset, fields_granted: filteredFields.length, fields_skipped_due_to_create_failure: skipped }
-            : { permset: payload.permset, fields_granted: filteredFields.length };
+            ? { permset: payload.permset, fields_granted: filteredFields.length, granted_fields: filteredFields, fields_skipped_due_to_create_failure: skipped }
+            : { permset: payload.permset, fields_granted: filteredFields.length, granted_fields: filteredFields };
         }
         if (step.operation.startsWith("create_workflow:")) {
           await retryBoundary(() => deployFlow(conn, step.payload as WorkflowPayload));
@@ -803,18 +808,23 @@ export const salesforceAdapter: Adapter = {
           // would have zero field entries, the redeploy still succeeds — empty permset
           // is valid SFDC metadata.
           const payload = step.payload as { permset: string; fields: string[] };
+          // P20: revoke FLS only for the fields THIS run actually granted (created fields).
+          // Newer runs store the exact granted list; older runs fall back to payload.fields.
+          // An adopted pre-existing field is never in granted_fields, so its FLS grant is
+          // left intact — same blast-radius guard as the create_field teardown above.
+          const grantedThisRun = (step.result as { granted_fields?: string[] } | null)?.granted_fields ?? payload.fields;
           const existingResp = await sf(conn, `/services/data/v62.0/query?q=${encodeURIComponent(
             `SELECT Field, PermissionsRead, PermissionsEdit FROM FieldPermissions WHERE Parent.Name = '${payload.permset}'`,
           )}`);
           const existing = (((existingResp.body as { records?: Array<{ Field: string; PermissionsRead: boolean; PermissionsEdit: boolean }> })?.records) ?? []);
-          const removeSet = new Set(payload.fields);
+          const removeSet = new Set(grantedThisRun);
           const keep = existing.filter((e) => !removeSet.has(e.Field));
           // Re-deploy with just the remaining fields (or empty if none). deployPermissionSet
           // does a fresh read inside, but since we pass [] for new fields it will reconcile
           // against current state — to actually REMOVE entries we have to bypass the helper
           // and write the redacted XML directly.
           await redeployPermissionSetExact(conn, payload.permset, keep.map((e) => ({ field: e.Field, read: !!e.PermissionsRead, edit: !!e.PermissionsEdit })));
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "grant_field_visibility", fields_removed: payload.fields.length, fields_remaining: keep.length } };
+          const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "grant_field_visibility", fields_removed: removeSet.size, fields_remaining: keep.length } };
           results.push(r); onStep(r);
         } else {
           // Stage deactivate-not-delete (the S0 catch) — we just record as reversed but the
