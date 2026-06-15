@@ -22,7 +22,7 @@
 | **Email notification action (create)** | `POST /settings/automation/email_notifications` | C R U D | REQUIRES a pre-existing email template (template creation is UI-only — `GET /settings/email_templates` is read-only). For MVP we use task actions instead to avoid the prerequisite | ✅ API (with manual prereq) |
 | Webhook action (create) | `POST /settings/automation/webhooks` | C R U D | Unprobed by us — standard shape, available for future workflow shapes | ✅ API |
 | Lead AssignmentRule (create) | none documented | — | Separate concept from workflow rules — no v8 REST create surface located. Achievable indirectly via a workflow_rule with a field_update action setting Lead.Owner | ❌ direct manual / ✅ indirect via workflow |
-| Standalone Function (Deluge) create | none | — | UI-only (Setup > Developer Hub > Functions). Functions can be REFERENCED by id in workflow_rule.actions once created — but creation itself is not REST-exposed in v8 | ❌ manual (round-robin needs this — see deluge-patterns doc for the canonical script) |
+| Standalone Function (Deluge) create | `POST /crm/v8/settings/functions` | C R · D | **REST-creatable** (corrected 2026-06-14 — earlier "UI-only" verdict was false). Form-encoded body: `metadata={"functions":[{name,display_name,category:"Automation",runtime:"Deluge 1.0",script,params}]}`. Full schema validated end-to-end against the live trial org. Gated by: **admin-authorized connection** ("initial function creation is restricted to administrators") + org Functions space enabled once. NOT YET WIRED in the adapter — round-robin still emits a manual note until the createDelugeFunction builder ships | ✅ API (admin-gated); ⏳ adapter wiring pending |
 | Record CRUD | `/crm/v8/{Module}` | C R U D | Standard | ✅ API |
 | Email template create | none | R only | `GET /settings/email_templates` is read-only — template creation is UI-only. Plan for email-notification flows accordingly | ❌ manual |
 | Org/instance creation | trial signup | — | Manual web step, no API | ❌ manual |
@@ -45,9 +45,9 @@
 
 ## Verdict summary for the spec engine
 
-**Everything in the v1 sales-function vocabulary IS provisionable** via REST after the 2026-06-13 correction. The only true manual-step gaps are: standalone Deluge function creation (UI-only), email template creation (UI-only), AssignmentRules (no REST create surface), org/trial signup (manual web). All other operations — fields, stages, pipelines, workflow rules with task / field-update / email-notification / webhook actions — work cleanly with the body shapes documented above and in [`zoho-deluge-patterns.md`](./zoho-deluge-patterns.md).
+**Everything in the v1 sales-function vocabulary IS provisionable** via REST. Standalone Deluge function creation is **also REST-capable** (corrected 2026-06-14 — see the Functions row above; admin-authorized connection required, adapter wiring pending). The remaining true manual-step gaps are: email template creation (UI-only), AssignmentRules (no REST create surface), org/trial signup (manual web). All other operations — fields, stages, pipelines, workflow rules with task / field-update / email-notification / webhook actions — work cleanly with the body shapes documented above and in [`zoho-deluge-patterns.md`](./zoho-deluge-patterns.md).
 
-For workflow shapes, the adapter currently implements `idle_deal_alert` (workflow rule + scheduled task action) and `field_derivation` (workflow rule + instant field-update action) as `supported`. `round_robin_assignment` is `manual` — the canonical Deluge script for the one-time UI paste is in the patterns doc.
+For workflow shapes, the adapter currently implements `idle_deal_alert` (workflow rule + scheduled task action) and `field_derivation` (workflow rule + instant field-update action) as `supported`. `round_robin_assignment` is still emitted as `manual` — NOT because Deluge can't be created over REST (it can), but because the adapter does not yet wire `createDelugeFunction`. Until that phase lands, the canonical Deluge script for a one-time create is in the patterns doc.
 
 ## Probe artifacts (S0 + post-harvest, on the trial org)
 

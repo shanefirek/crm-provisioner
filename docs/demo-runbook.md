@@ -84,7 +84,7 @@ PORT=8788 ZOHO_LIVE=1 SF_LIVE=1 bash scripts/smoke-p0.sh
 ## What's deliberately NOT in the MVP (and the honest answer if asked)
 
 - **Hosted chat UI for non-Claude users.** Coming as a thin skin over the same MCP — *not* a rewrite.
-- **Workflow creation in Zoho.** Marked UNSUPPORTED in plan output. Honest about it. Deluge function-creation body shape is in the next-spike list.
+- **Workflow creation in Zoho.** Workflow rules + task/field-update actions are supported. `round_robin_assignment` still emits a manual note pending the `createDelugeFunction` builder — but Deluge function creation is REST-capable (admin-gated; body shape proven 2026-06-14, see zoho-deluge-patterns.md), not a research unknown.
 - **Pipeline DELETE in Zoho.** S0 returned 400 on the only documented shape; teardown records `pipeline_remains_in_layout_residue` rather than lying about success.
 - **OAuth web flow for SFDC.** Currently uses the local `sf` CLI auth chain. P3 host work (post-MVP) replaces with a proper redirect.
 - **Multi-tenant deployment.** Local Postgres for dev; Railway one-tenant deploy for first customer. Multi-tenancy is a P5 question, not blocking the MVP.

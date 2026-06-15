@@ -2,9 +2,11 @@
 
 You've walked into this repo cold (or it's been a few days). This is the single doc that gets you back to full speed in ~5 minutes. Read in order; descend to specific docs only when their topic applies to your task.
 
-## 🟡 Open thread to settle before P8 (paused 2026-06-13, end of session)
+## 🟢 Deluge question — ANSWERED 2026-06-14 (capability proven, adapter wiring pending)
 
-**The Zoho Deluge question.** Earlier we marked `round_robin_assignment` as `manual` because the standard implementation is a Deluge function and S0 probed `POST /crm/v8/settings/functions` once, got `REQUIRED_PARAM_MISSING: metadata`, and gave up. The harvest formalized that as `manual` with a documented one-time-paste script.
+**Programmatic Deluge function creation works.** `POST /crm/v8/settings/functions` with a form-encoded `metadata={"functions":[{...}]}` body passes full schema validation against the live trial org (body shape in [`zoho-deluge-patterns.md`](./surfaces/zoho-deluge-patterns.md) → "Programmatic Deluge function creation"). The old `manual / not REST-creatable` verdict was FALSE — it came from one malformed S0 probe. Remaining gate is **authorization, not capability**: the connection must be admin-authorized ("initial function creation is restricted to administrators") and the token needs `ZohoCRM.users.READ` for the pool. **Next phase:** add the `createDelugeFunction` builder + flip `round_robin_assignment` to supported, gated on an admin re-grant to verify a literal 201. Historical context below preserved for the record.
+
+**Original framing (2026-06-13, now superseded).** Earlier we marked `round_robin_assignment` as `manual` because the standard implementation is a Deluge function and S0 probed `POST /crm/v8/settings/functions` once, got `REQUIRED_PARAM_MISSING: metadata`, and gave up. The harvest formalized that as `manual` with a documented one-time-paste script.
 
 **Shane's correction:** "Deluge is not UI-only — people use Deluge." This is correct. The Zoho partner ecosystem (Ashim's network) lives in Deluge; calling it manual undersells our app. We considered the webhook workaround (Zoho fires `/webhooks/zoho/{conn_id}/round-robin` at our server, server picks owner via REST) but Shane correctly pushed back: that's dodging Deluge, not handling it. If our pitch is "we configure Zoho via Claude," we have to ship Deluge programmatically the way partners do.
 
@@ -56,7 +58,7 @@ A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (
 
 ## What's NOT working / explicitly deferred
 
-- **Zoho round_robin_assignment** is `manual` — Zoho Deluge functions are UI-only, no REST create surface. Adapter records the gap with the canonical Deluge script in the plan output. See [`docs/surfaces/zoho-deluge-patterns.md`](./surfaces/zoho-deluge-patterns.md).
+- **Zoho round_robin_assignment** is emitted as `manual` — but only because the adapter doesn't yet wire `createDelugeFunction`. Deluge functions ARE REST-creatable (admin-gated; body shape proven 2026-06-14). Plan output carries the canonical Deluge script meanwhile. See [`docs/surfaces/zoho-deluge-patterns.md`](./surfaces/zoho-deluge-patterns.md).
 - **Zoho assignment rules** (the Lead.AssignmentRules concept, separate from workflow_rules) — no v8 REST create surface. Achievable indirectly via a workflow_rule with a field_update action setting Lead.Owner.
 - **Zoho email templates** — read-only via API. For email-based workflow shapes we use task actions (no template needed).
 - **SFDC OAuth web flow** — adapter currently shells out to local `sf api request rest`. P3 host work replaces with proper OAuth. The CLI's `~/.sfdx/{user}.json` token is encrypted with a machine-local key; direct Bearer fetch fails.
