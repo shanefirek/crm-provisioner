@@ -27,7 +27,7 @@ Reference: this conversation parked at "let's pause" after the spike was propose
 
 ## What this repo is, in one paragraph
 
-A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (real-estate, professional-services, hvac-services, manufacturing — or toy-sales for smoke), authors a small **delta** over it, runs validate → plan → apply, and the deterministic driver pushes the resulting config into Salesforce or Zoho via a per-CRM adapter. Postgres on Railway holds connections + run history. The whole product surface is **8 MCP tools**; there is no UI in v1. Equity venture with Stefan (sourcing/review), Ashim (distribution), Varun (Deluge/product) — Shane sole builder.
+A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (real-estate, professional-services, hvac-services, manufacturing — or toy-sales for smoke), authors a small **delta** over it, runs validate → plan → apply, and the deterministic driver pushes the resulting config into Salesforce or Zoho via a per-CRM adapter. Postgres on Railway holds connections + run history. The whole product surface is **8 MCP tools**; there is no UI in v1. Venture context and team structure tracked in local-only docs (see CLAUDE.md routing).
 
 ## What's working, today
 

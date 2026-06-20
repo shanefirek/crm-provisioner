@@ -10,7 +10,7 @@
 6. **Deluge = compile target with a vetted pattern library (≤8), not a language to learn.** Varun/UD are the Deluge oracle; patterns enter the library only deploy-tested. Same fail-closed shape as the spec's extension points.
 7. **Adapter order deliberately unresolved.** Plan builds SFDC first (scratch orgs = scriptable demos; TRA fundraising lean per Stefan 610-612) but Zoho-first remains arguable (Ashim's UD = customer #1). To be settled at the Stefan 1:1 — distribution/fundraising decision, not technical. The agnostic core makes the cost of being wrong one phase's reordering.
 8. **Calendar reality:** next 2 weeks hold 5 interview motions (Cloudflare, Financial Cents, Tempo exec, ApartmentIQ, +). Realistic plan: S0+P0+P1+P2 (SFDC demo) inside 2 weeks; P3-P4 the week after. Beating it is upside, not the plan.
-9. **IP hygiene:** clean-room rule in CLAUDE.md; nothing signed with Stefan/Ashim/Varun yet — equity structure pending the 1:1 ("co-founder tier not dev-hire tier" agreed in principle by text, 6/12). Don't deliver P2+ artifacts to the group before terms are at least sketched in writing.
+9. **IP hygiene:** clean-room rule in CLAUDE.md observed throughout; venture structure and external-party context tracked in local-only docs (see CLAUDE.md routing).
 
 ## 2026-06-12 (late) — entry 10: Host pivot, Cloudflare → Railway
 
