@@ -1,6 +1,6 @@
 # Demo Runbook — crm-provisioner MVP
 
-Two scripts: one for a partner pre-sales / consultant audience, one for an investor audience. Both use the same backend; the words and the shape change. Audience-specific framing tracked in local-only docs (see CLAUDE.md routing).
+Two scripts: one for a partner pre-sales / consultant audience, one for an investor audience. Both use the same backend; the words and the shape change.
 
 ## Pre-flight (do once)
 
