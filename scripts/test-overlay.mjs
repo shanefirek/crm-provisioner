@@ -9,6 +9,8 @@
 // Runs standalone — no server, no DB.
 
 import { applyOverlay, stableHash } from "../src/core/overlay.ts";
+import { DeltaSpecSchema, ProvisionSpecSchema } from "../src/core/spec.ts";
+import { getTemplate } from "../src/core/templates.ts";
 
 let passed = 0;
 let failed = 0;
@@ -119,6 +121,33 @@ assert("stableHash deterministic on null/undefined values", h5 === h6);
 const h7 = stableHash({ a: 1 });
 const h8 = stableHash({ a: 2 });
 assert("stableHash distinguishes different content", h7 !== h8, `both produced ${h7}`);
+
+console.log("\n== P22: default spec_version handling ==");
+
+const realEstate = getTemplate("real-estate");
+const missingSpecVersion = {
+  fields: [{ api_name: "referral_source", label: "Referral Source", kind: "text", module: "Lead", length: 80 }],
+  stages: [],
+  pipelines: [],
+  workflows: [],
+};
+const parsedMissing = DeltaSpecSchema.safeParse(missingSpecVersion);
+assert("delta without spec_version parses successfully", parsedMissing.success, parsedMissing.success ? "" : JSON.stringify(parsedMissing.error.issues));
+if (parsedMissing.success && realEstate) {
+  const overlaid = applyOverlay(realEstate, parsedMissing.data);
+  assert("delta without spec_version overlays cleanly against a template", overlaid.ok, overlaid.ok ? "" : JSON.stringify(overlaid.errors));
+  if (overlaid.ok) {
+    const finalParsed = ProvisionSpecSchema.safeParse(overlaid.spec);
+    assert("resolved spec after defaulted spec_version is valid", finalParsed.success, finalParsed.success ? "" : JSON.stringify(finalParsed.error.issues));
+  }
+}
+
+const mismatchedSpecVersion = {
+  spec_version: 1,
+  fields: [], stages: [], pipelines: [], workflows: [],
+};
+const parsedMismatch = DeltaSpecSchema.safeParse(mismatchedSpecVersion);
+assert("delta with mismatched spec_version is rejected", !parsedMismatch.success, parsedMismatch.success ? "unexpected success" : "");
 
 console.log(`\n  ${passed} passed / ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

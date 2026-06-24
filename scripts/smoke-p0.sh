@@ -1016,6 +1016,16 @@ if [ "${ZOHO_LIVE:-0}" = "1" ]; then
   fi
   [ -n "${ZOHO_REFRESH_TOKEN:-}" ] && pass "ZOHO_REFRESH_TOKEN present in .dev.vars" || fail "ZOHO_REFRESH_TOKEN present" "missing"
 
+  # Friday-demo shim: connect_crm with NO Zoho auth args hydrates from env-backed
+  # host defaults, then tightens the writable_org_ids allowlist to that api_domain.
+  R=$(mcp_call 6000 'tools/call' '{"name":"connect_crm","arguments":{"crm":"zoho","org_label":"zoho env fallback (LIVE)","is_demo":true}}' | text_of)
+  ZF_CONN=$(echo "$R" | field_of connection_id)
+  ZF_API=$(echo "$R" | field_of api_domain)
+  ZF_WL=$(echo "$R" | node -e "const j=JSON.parse(require('fs').readFileSync(0)); process.stdout.write(String((j.writable_org_ids||[])[0]||''));")
+  [ -n "$ZF_CONN" ] && pass "live Zoho env-fallback connect created connection" || fail "Zoho env-fallback connect" "$R"
+  [ "$ZF_API" = "${ZOHO_API_BASE:-https://www.zohoapis.com}" ] && pass "live Zoho env-fallback resolved api_domain from env" || fail "Zoho env-fallback api_domain" "got '$ZF_API'"
+  [ "$ZF_WL" = "$ZF_API" ] && pass "live Zoho env-fallback tightened writable_org_ids to api_domain" || fail "Zoho env-fallback writable_org_ids" "got '$ZF_WL' expected '$ZF_API'"
+
   ARGS=$(ZRT="$ZOHO_REFRESH_TOKEN" ZDC="${ZOHO_DC:-com}" ZAD="${ZOHO_API_BASE:-https://www.zohoapis.com}" node -e '
 const a = { name: "connect_crm", arguments: {
   crm: "zoho",
@@ -1099,6 +1109,40 @@ process.stdout.write((d.snapshot?.fields_lead||[]).find(x=>x.api_name==='prov_zo
 ")
   [ "$GONE" = "gone" ] && pass "live Zoho: probe field removed by teardown" || fail "Zoho field removed" "got $GONE"
 
+  # Pipeline teardown uses Zoho's delete-marker workaround on the specific pipeline id.
+  # Use run-scoped names so the assertion stays load-bearing even if a prior run died
+  # before teardown and left the old pipeline behind.
+  ZPIPE_RUN_ID="$(date +%s)-$$"
+  ZPIPE_STAGE_A="ProvPipeA_${ZPIPE_RUN_ID}"
+  ZPIPE_STAGE_B="ProvPipeB_${ZPIPE_RUN_ID}"
+  ZPIPE_NAME="ProvPipe_${ZPIPE_RUN_ID}"
+  ZPIPE_DELTA=$(ZPIPE_STAGE_A="$ZPIPE_STAGE_A" ZPIPE_STAGE_B="$ZPIPE_STAGE_B" ZPIPE_NAME="$ZPIPE_NAME" node -e '
+const d = {
+  spec_version: 0,
+  fields: [],
+  stages: [
+    { api_name: process.env.ZPIPE_STAGE_A, label: process.env.ZPIPE_STAGE_A, forecast_category: "Pipeline", forecast_type: "Open", probability: 15 },
+    { api_name: process.env.ZPIPE_STAGE_B, label: process.env.ZPIPE_STAGE_B, forecast_category: "Pipeline", forecast_type: "Open", probability: 35 },
+  ],
+  pipelines: [
+    { api_name: process.env.ZPIPE_NAME, label: process.env.ZPIPE_NAME, module: "Deal", stages: [process.env.ZPIPE_STAGE_A, process.env.ZPIPE_STAGE_B] },
+  ],
+  workflows: [],
+};
+process.stdout.write(JSON.stringify(d));
+')
+  R=$(mcp_call 665 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"toy-sales\",\"delta\":$ZPIPE_DELTA}}" | text_of)
+  ZPIPE_PLAN=$(echo "$R" | field_of plan_id)
+  [ -n "$ZPIPE_PLAN" ] && pass "live Zoho: pipeline-delete test plan returned plan_id" || fail "Zoho pipeline-delete test plan" "$R"
+  R=$(mcp_call 666 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$ZPIPE_PLAN\"}}" | text_of)
+  ZPIPE_RUN=$(echo "$R" | field_of run_id)
+  [ "$(echo "$R" | field_of status)" = "succeeded" ] && pass "live Zoho: pipeline-delete test apply succeeded" || fail "Zoho pipeline-delete test apply" "$R"
+  R=$(mcp_call 667 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$ZPIPE_RUN\"}}" | text_of)
+  [ "$(echo "$R" | field_of status)" = "succeeded" ] && pass "live Zoho: pipeline-delete test teardown succeeded" || fail "Zoho pipeline-delete test teardown" "$R"
+  R=$(mcp_call 668 'tools/call' "{\"name\":\"inspect_instance\",\"arguments\":{\"connection_id\":\"$Z_CONN\"}}" | text_of)
+  ZPIPE_GONE=$(echo "$R" | node -e "const d=JSON.parse(require('fs').readFileSync(0));process.stdout.write((d.snapshot?.pipelines||[]).some(x=>x.api_name==='$ZPIPE_NAME')?'still-there':'gone')")
+  [ "$ZPIPE_GONE" = "gone" ] && pass "live Zoho: teardown removed the created pipeline" || fail "Zoho pipeline removed" "got $ZPIPE_GONE for $ZPIPE_NAME"
+
   # Workflow shapes (post-harvest): idle_deal_alert + field_derivation are SUPPORTED,
   # round_robin_assignment stays MANUAL. Plan should show idle_deal_alert as 'create',
   # not 'unsupported', and apply should create the workflow rule in the live trial.
@@ -1159,6 +1203,31 @@ const s=(d.steps||[]).find(x=>x.operation==='create_workflow:round_robin_assignm
 process.stdout.write((s?.notes||'').includes('Deluge') ? 'yes' : 'no');
 ")
   [ "$RR_NOTE" = "yes" ] && pass "live Zoho: round_robin still UNSUPPORTED with Deluge guidance note" || fail "round_robin manual note" "got $RR_NOTE"
+
+  # P23: native standard-field adoption — real-estate's lead_source should adopt Zoho's
+  # native Lead_Source field rather than colliding with DUPLICATE_DATA on apply.
+  R=$(mcp_call 75 'tools/call' "{\"name\":\"plan\",\"arguments\":{\"connection_id\":\"$Z_CONN\",\"template_ref\":\"real-estate\",\"delta\":{\"fields\":[],\"stages\":[],\"pipelines\":[],\"workflows\":[]}}}" | text_of)
+  RE_PLAN=$(echo "$R" | field_of plan_id)
+  [ -n "$RE_PLAN" ] && pass "P23 live Zoho: real-estate plan returned plan_id" || fail "P23 real-estate plan" "$R"
+  RE_ADOPT=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field' && x.payload?.api_name==='lead_source');
+process.stdout.write(s?.diff || 'missing');
+")
+  [ "$RE_ADOPT" = "adopt" ] && pass "P23 live Zoho: real-estate lead_source plans as ADOPT" || fail "P23 Zoho lead_source adopt" "got '$RE_ADOPT'"
+  R=$(mcp_call 76 'tools/call' "{\"name\":\"apply\",\"arguments\":{\"plan_id\":\"$RE_PLAN\"}}" | text_of)
+  RE_RUN=$(echo "$R" | field_of run_id)
+  RE_STATUS=$(echo "$R" | field_of status)
+  [ "$RE_STATUS" = "succeeded" ] && pass "P23 live Zoho: real-estate apply succeeded" || fail "P23 real-estate apply" "$R"
+  R=$(mcp_call 77 'tools/call' "{\"name\":\"get_run\",\"arguments\":{\"run_id\":\"$RE_RUN\"}}" | text_of)
+  RE_NATIVE=$(echo "$R" | node -e "
+const d=JSON.parse(require('fs').readFileSync(0));
+const s=(d.steps||[]).find(x=>x.operation==='create_field' && x.payload_json?.api_name==='lead_source');
+process.stdout.write(s?.result_json?.adopted_kind || 'missing');
+")
+  [ "$RE_NATIVE" = "native_standard_field" ] && pass "P23 live Zoho: real-estate lead_source adopted native field" || fail "P23 native field result" "got '$RE_NATIVE'"
+  R=$(mcp_call 78 'tools/call' "{\"name\":\"teardown_run\",\"arguments\":{\"run_id\":\"$RE_RUN\"}}" | text_of)
+  [ "$(echo "$R" | field_of status)" = "succeeded" ] && pass "P23 live Zoho: real-estate teardown succeeded" || fail "P23 real-estate teardown" "$R"
 
   # ===== Vertical template viability against live Zoho =====
   # plan-only (not apply) for all 4 verticals — viability check that field types

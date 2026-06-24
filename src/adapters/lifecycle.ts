@@ -125,7 +125,13 @@ export async function runApplyLoop(
     // provenance:"adopted" so teardown knows this asset pre-existed and must NOT be
     // deleted (it isn't ours). No vendor call, so no shouldAbort check needed.
     if (step.diff === "adopt") {
-      const r: StepResult = { seq: step.seq, status: "succeeded", result: { adopted: true, provenance: "adopted" } };
+      const payload = step.payload && typeof step.payload === "object" && !Array.isArray(step.payload)
+        ? step.payload as Record<string, unknown>
+        : null;
+      const adoptResult = payload?.adopt_result && typeof payload.adopt_result === "object" && !Array.isArray(payload.adopt_result)
+        ? payload.adopt_result as Record<string, unknown>
+        : null;
+      const r: StepResult = { seq: step.seq, status: "succeeded", result: adoptResult ? { ...adoptResult, adopted: true, provenance: "adopted" } : { adopted: true, provenance: "adopted" } };
       results.push(r);
       onStep(r);
       continue;

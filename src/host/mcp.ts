@@ -80,7 +80,7 @@ function validateAndResolve(
   }
   const parsed = DeltaSpecSchema.safeParse(delta);
   if (!parsed.success) {
-    return { ok: false, error: "DELTA_SCHEMA_INVALID", details: parsed.error.issues };
+    return { ok: false, error: "DELTA_SCHEMA_INVALID", details: enrichDeltaIssues(delta, parsed.error.issues) };
   }
   const overlay = applyOverlay(template, parsed.data);
   if (!overlay.ok) {
@@ -91,6 +91,51 @@ function validateAndResolve(
     return { ok: false, error: "RESOLVED_SPEC_INVALID", details: final.error.issues };
   }
   return { ok: true, spec: final.data, spec_hash: overlay.spec_hash, template: `${template.id}@${template.version}` };
+}
+
+const WORKFLOW_SHAPE_EXAMPLES: Record<string, Record<string, unknown>> = {
+  idle_deal_alert: {
+    shape: "idle_deal_alert",
+    api_name: "prov_idle_alert",
+    pipeline: "Residential",
+    stage: "Inquiry_Received",
+    idle_days: 14,
+    notify: "owner",
+  },
+  field_derivation: {
+    shape: "field_derivation",
+    api_name: "prov_field_derivation",
+    module: "Lead",
+    target_field: "lead_score_bucket",
+    source_field: "Annual_Revenue",
+    when: "on_save",
+  },
+  round_robin_assignment: {
+    shape: "round_robin_assignment",
+    api_name: "prov_round_robin",
+    module: "Lead",
+    pool: ["agent1@example.com", "agent2@example.com"],
+    when_source_equals: ["Zillow", "Referral"],
+  },
+};
+
+function enrichDeltaIssues(delta: unknown, issues: z.ZodIssue[]): z.ZodIssue[] {
+  const workflows = delta && typeof delta === "object" && !Array.isArray(delta)
+    ? (delta as { workflows?: unknown[] }).workflows
+    : undefined;
+  return issues.map((issue) => {
+    const [root, idx] = issue.path;
+    if (root !== "workflows" || typeof idx !== "number" || !Array.isArray(workflows)) return issue;
+    const candidate = workflows[idx];
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return issue;
+    const shape = (candidate as { shape?: unknown }).shape;
+    if (typeof shape !== "string" || !(shape in WORKFLOW_SHAPE_EXAMPLES)) return issue;
+    const example = JSON.stringify(WORKFLOW_SHAPE_EXAMPLES[shape]);
+    return {
+      ...issue,
+      message: `${issue.message}. Expected workflow shape for ${shape}: ${example}`,
+    };
+  });
 }
 
 export function buildMcpServer(): McpServer {
@@ -112,7 +157,7 @@ export function buildMcpServer(): McpServer {
     "connect_crm",
     {
       description:
-        "Register a connection to a CRM instance. MVP HARDENING (enforced by apply()): every connection must declare is_demo=true to be writable, AND api_domain must appear in writable_org_ids — non-demo connections are READ-ONLY via inspect_instance, never writable. CRM-specific args: for 'salesforce', P2 reads auth from local `sf` CLI chain (~/.sfdx/{user}.json — token is CLI-encrypted, NEVER from `sf org display`-emitted stdout); for 'zoho', pass refresh_token + dc ('com'|'eu'|'in'|'com.au'). Three crm values: 'memory' (stub, ALL ops supported, in-process state), 'salesforce' (live; see capability map), 'zoho' (live; see capability map). Returns connection_id used by every other tool.",
+        "Register a connection to a CRM instance. MVP HARDENING (enforced by apply()): every connection must declare is_demo=true to be writable, AND api_domain must appear in writable_org_ids — non-demo connections are READ-ONLY via inspect_instance, never writable. CRM-specific args: for 'salesforce', P2 reads auth from local `sf` CLI chain (~/.sfdx/{user}.json — token is CLI-encrypted, NEVER from `sf org display`-emitted stdout); for 'zoho', pass refresh_token + dc ('com'|'eu'|'in'|'com.au'). On the single-tenant hosted demo surface, a demo Zoho connect that omits ALL three auth args (`refresh_token`, `dc`, `api_domain`) may fall back to the host's env-backed default trial connection; explicit args always win. Three crm values: 'memory' (stub, ALL ops supported, in-process state), 'salesforce' (live; see capability map), 'zoho' (live; see capability map). Returns connection_id used by every other tool.",
       inputSchema: {
         crm: z.enum(["memory", "salesforce", "zoho"]).default("memory"),
         org_label: z.string().optional(),
@@ -129,11 +174,31 @@ export function buildMcpServer(): McpServer {
       },
     },
     async ({ crm, org_label, is_demo, writable_org_ids, api_domain, access_token, refresh_token, dc, sf_alias }) => {
+      let effectiveWritableOrgIds = writable_org_ids;
+      let effectiveApiDomain = api_domain;
+      let effectiveRefreshToken = refresh_token;
+      let effectiveDc = dc;
+
+      // Friday-demo shim: when the hosted chat surface asks for a Zoho demo connection
+      // with NO auth args at all, hydrate them from the host env. This keeps the seam
+      // narrow (single-tenant demo convenience only): partial/explicit Zoho args stay on
+      // the normal path, and the real fix remains chat-layer OAuth + injected workspace
+      // connections. Tighten writable_org_ids to the resolved api_domain so the existing
+      // demo-org gate stays fail-closed rather than broadening to "allow any".
+      if (crm === "zoho" && is_demo && !effectiveRefreshToken && !effectiveDc && !effectiveApiDomain) {
+        effectiveRefreshToken = process.env.ZOHO_REFRESH_TOKEN;
+        effectiveDc = process.env.ZOHO_DC;
+        effectiveApiDomain = process.env.ZOHO_API_BASE;
+        if (effectiveApiDomain && effectiveWritableOrgIds.length === 0) {
+          effectiveWritableOrgIds = [effectiveApiDomain];
+        }
+      }
+
       // P10 fix #5: Zoho api_domain is per-DC tenant config (tier-2). The token-exchange
       // response returns it; without it the adapter silently falls back to zohoapis.com
       // and every API call for an EU/IN/AU customer 404s. Fail-at-boot, not fall-back —
       // configuration-philosophy tier-2 rule.
-      if (crm === "zoho" && !api_domain) {
+      if (crm === "zoho" && !effectiveApiDomain) {
         return ok(
           JSON.stringify({
             ok: false,
@@ -175,16 +240,16 @@ export function buildMcpServer(): McpServer {
           crm,
           org_label ?? `${crm} connection`,
           is_demo,
-          writable_org_ids,
-          api_domain ?? null,
+          effectiveWritableOrgIds,
+          effectiveApiDomain ?? null,
           access_token ?? null,
-          refresh_token ?? null,
-          dc ?? null,
+          effectiveRefreshToken ?? null,
+          effectiveDc ?? null,
           key,
           sf_alias ?? null,
         ],
       );
-      return ok(JSON.stringify({ connection_id: id, crm, is_demo, writable_org_ids, api_domain: api_domain ?? null, dc: dc ?? null, sf_alias: sf_alias ?? null }, null, 2));
+      return ok(JSON.stringify({ connection_id: id, crm, is_demo, writable_org_ids: effectiveWritableOrgIds, api_domain: effectiveApiDomain ?? null, dc: effectiveDc ?? null, sf_alias: sf_alias ?? null }, null, 2));
     },
   );
 
@@ -193,7 +258,7 @@ export function buildMcpServer(): McpServer {
     "inspect_instance",
     {
       description:
-        "Read the current state of the connected CRM scoped to the spec's vocabulary (fields, stages, pipelines, workflows). ALWAYS SAFE — never writes, hardening rules don't apply. The model SHOULD call this before authoring a delta to ground its choices in the org's actual current state (avoids creating fields that already exist with a different name, choosing stage forecast_categories the org doesn't have, etc.). Snapshot shape is CRM-specific: SFDC returns `fields_lead` + `stages` + `flows`; Zoho returns `fields_lead` + `stages` (with id/probability/forecast_category) + `pipelines` + `stage_field_id` + `default_deals_layout_id`; memory returns the in-process state.",
+        "Read the current state of the connected CRM scoped to the spec's vocabulary (fields, stages, pipelines, workflows). ALWAYS SAFE — never writes, hardening rules don't apply. The model SHOULD call this before authoring a delta to ground its choices in the org's actual current state (avoids creating fields that already exist with a different name, choosing stage forecast_categories the org doesn't have, etc.). Snapshot shape is CRM-specific: SFDC returns `fields_lead` + `stages` + `flows`; Zoho returns `fields_lead` + `fields_deals` + `fields_contacts` + `fields_accounts` + `stages` (with id/probability/forecast_category) + `pipelines` + `stage_field_id` + `default_deals_layout_id`; memory returns the in-process state.",
       inputSchema: { connection_id: z.string() },
     },
     async ({ connection_id }) => {
@@ -524,7 +589,7 @@ export function buildMcpServer(): McpServer {
     "teardown_run",
     {
       description:
-        "Reverse the successful steps of a previous run, newest-first. Idempotent — already-absent resources count as success. Requires the original run's connection to still satisfy the writability gate (is_demo + allowlist). Records a NEW run row with teardown_of_run linking back to the original. Per-CRM teardown semantics that callers should expect (some leave residue, honestly recorded): SFDC create_field is reversed via destructiveChanges deploy (clean); SFDC add_stage records 'stage_deactivated_only' (SFDC deactivate-not-delete); Zoho create_field is reversed via DELETE (clean); Zoho add_stage records 'stage_picklist_value_remains' (whole-array PATCH-only); Zoho create_pipeline records 'pipeline_remains_in_layout_residue' (S0 found DELETE returns 400). Use after every demo to leave the org clean for the next session — but check the residue notes in the response.",
+        "Reverse the successful steps of a previous run, newest-first. Idempotent — already-absent resources count as success. Requires the original run's connection to still satisfy the writability gate (is_demo + allowlist). Records a NEW run row with teardown_of_run linking back to the original. Per-CRM teardown semantics that callers should expect (some leave residue, honestly recorded): SFDC create_field is reversed via destructiveChanges deploy (clean); SFDC add_stage records 'stage_deactivated_only' (SFDC deactivate-not-delete); Zoho create_field is reversed via DELETE (clean); Zoho add_stage records 'stage_picklist_value_remains' (whole-array PATCH-only); Zoho create_pipeline uses the documented delete-marker workaround on the pipeline id scoped to its layout (see the Zoho org-variance taxonomy's PIPELINE_DELETE_MARKER_PATH bucket). Use after every demo to leave the org clean for the next session — but check the residue notes in the response.",
       inputSchema: { run_id: z.string() },
     },
     async ({ run_id }) => {

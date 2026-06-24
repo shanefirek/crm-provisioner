@@ -111,7 +111,7 @@ export type ProvisionSpec = z.infer<typeof ProvisionSpecSchema>;
 // .strict() so unknown keys are REJECTED, not silently dropped — fail-closed schema,
 // same principle as the overlay resolver's default-deny on extension points.
 export const DeltaSpecSchema = ProvisionSpecSchema.omit({ extends: true, spec_version: true }).extend({
-  spec_version: z.literal(0),
+  spec_version: z.literal(0).default(0),
 }).strict();
 export type DeltaSpec = z.infer<typeof DeltaSpecSchema>;
 

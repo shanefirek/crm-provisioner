@@ -85,7 +85,7 @@ async function mintAccessToken(conn: ConnectionContext): Promise<string> {
 async function zoho(
   conn: ConnectionContext,
   path: string,
-  init: { method?: "GET" | "POST" | "PATCH" | "DELETE"; body?: unknown } = {},
+  init: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown } = {},
 ): Promise<{ status: number; body: unknown; retryAfter?: string | null }> {
   // P10 fix #5 (defense in depth): connect_crm rejects Zoho connections without api_domain,
   // but the adapter checks too in case a connection row was created out-of-band.
@@ -124,25 +124,54 @@ async function zoho(
 
 type Snapshot = {
   // P20: data_type/length carry the field's shape for adopt-or-create compatibility.
-  fields_lead: Array<{ id: string; api_name: string; data_type: string | null; length: number | null }>;
+  fields_lead: Array<{ id: string; api_name: string; data_type: string | null; length: number | null; custom_field: boolean }>;
   // P12: Deals custom fields. Previously the teardown branch for non-Leads modules
   // re-fetched a full snapshot AND mis-aliased `fields_lead` for Deals lookups (audit
   // finding #4 + a side-effect bug — Deals teardown lookups never resolved).
-  fields_deals: Array<{ id: string; api_name: string; data_type: string | null; length: number | null }>;
+  fields_deals: Array<{ id: string; api_name: string; data_type: string | null; length: number | null; custom_field: boolean }>;
+  fields_contacts: Array<{ id: string; api_name: string; data_type: string | null; length: number | null; custom_field: boolean }>;
+  fields_accounts: Array<{ id: string; api_name: string; data_type: string | null; length: number | null; custom_field: boolean }>;
   stages: Array<{ id: string; api_name: string; probability: number; forecast_category_id: string; forecast_category_name: string }>;
   pipelines: Array<{ id: string; api_name: string }>;
   stage_field_id: string | null;
   default_deals_layout_id: string | null;
 };
 
+const ZOHO_NATIVE_STANDARD_FIELDS = {
+  Leads: ["Latitude","Longitude","Owner","Company","First_Name","Last_Name","Designation","Email","Phone","Fax","Mobile","Website","Lead_Source","Lead_Status","Industry","No_of_Employees","Annual_Revenue","Rating","Created_By","Modified_By","Created_Time","Modified_Time","Full_Name","Description","Skype_ID","Email_Opt_Out","Salutation","Secondary_Email","Last_Activity_Time","Twitter","Tag","Record_Image","Converted_Date_Time","Lead_Conversion_Time","Unsubscribed_Mode","Unsubscribed_Time","Converted_Account","Converted_Contact","Converted_Deal","id","Change_Log_Time__s","Converted__s","Locked__s","Last_Enriched_Time__s","Enrich_Status__s","Record_Status__s","Address","City","Coordinates","Country","Flat_House_No_Building_Apartment_Name","State","Street","Zip_Code","nearby_distance__s"],
+  Deals: ["Owner","Amount","Deal_Name","Closing_Date","Account_Name","Stage","Type","Probability","Next_Step","Lead_Source","Campaign_Source","Created_By","Modified_By","Created_Time","Modified_Time","Description","Contact_Name","Expected_Revenue","Last_Activity_Time","Lead_Conversion_Time","Sales_Cycle_Duration","Overall_Sales_Duration","Tag","Pipeline","id","Change_Log_Time__s","Locked__s","Reason_For_Loss__s","Record_Status__s","Stage_Modified_Time"],
+  Contacts: ["Mailing_Latitude","Mailing_Longitude","Other_Latitude","Other_Longitude","Owner","Lead_Source","First_Name","Last_Name","Account_Name","Vendor_Name","Email","Title","Department","Phone","Home_Phone","Other_Phone","Fax","Mobile","Date_of_Birth","Assistant","Asst_Phone","Created_By","Modified_By","Created_Time","Modified_Time","Full_Name","Description","Email_Opt_Out","Skype_ID","Salutation","Secondary_Email","Last_Activity_Time","Twitter","Tag","Record_Image","Reporting_To","Unsubscribed_Mode","Unsubscribed_Time","id","Change_Log_Time__s","Locked__s","Last_Enriched_Time__s","Enrich_Status__s","Record_Status__s","Mailing_Address","Mailing_City","Mailing_Coordinates","Mailing_Country","Mailing_Flat_House_No_Building_Apartment_Name","Mailing_State","Mailing_Street","Mailing_Zip","Other_Address","Other_City","Other_Coordinates","Other_Country","Other_Flat_House_No_Building_Apartment_Name","Other_State","Other_Street","Other_Zip","nearby_distance__s"],
+  Accounts: ["Billing_Latitude","Billing_Longitude","Shipping_Latitude","Shipping_Longitude","Owner","Rating","Account_Name","Phone","Account_Site","Fax","Parent_Account","Website","Account_Number","Ticker_Symbol","Account_Type","Ownership","Industry","Employees","Annual_Revenue","SIC_Code","Created_By","Modified_By","Created_Time","Modified_Time","Description","Last_Activity_Time","Tag","Record_Image","id","Change_Log_Time__s","Locked__s","Last_Enriched_Time__s","Enrich_Status__s","Record_Status__s","Billing_Address","Billing_City","Billing_Coordinates","Billing_Country","Billing_Flat_House_No_Building_Apartment_Name","Billing_State","Billing_Street","Billing_Code","Shipping_Address","Shipping_City","Shipping_Coordinates","Shipping_Country","Shipping_Flat_House_No_Building_Apartment_Name","Shipping_State","Shipping_Street","Shipping_Code","nearby_distance__s"],
+} as const;
+
+function moduleApiForZoho(module: string): "Leads" | "Deals" | "Contacts" | "Accounts" | string {
+  if (module === "Lead") return "Leads";
+  if (module === "Deal") return "Deals";
+  if (module === "Contact") return "Contacts";
+  if (module === "Account") return "Accounts";
+  return module;
+}
+
+function normalizeZohoFieldName(name: string): string {
+  return name.replace(/[ _]/g, "").toLowerCase();
+}
+
+function snapshotFieldsForModule(snap: Snapshot, moduleApi: string) {
+  if (moduleApi === "Leads") return snap.fields_lead;
+  if (moduleApi === "Deals") return snap.fields_deals;
+  if (moduleApi === "Contacts") return snap.fields_contacts;
+  if (moduleApi === "Accounts") return snap.fields_accounts;
+  return [];
+}
+
 async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
   const leadFields = await zoho(conn, "/crm/v8/settings/fields?module=Leads");
-  const fields_lead = (((leadFields.body as { fields?: Array<{ id: string; api_name: string; data_type?: string; length?: number }> })?.fields) ?? [])
+  const fields_lead = (((leadFields.body as { fields?: Array<{ id: string; api_name: string; data_type?: string; length?: number; custom_field?: boolean }> })?.fields) ?? [])
     .filter((f) => !!f.api_name)
-    .map((f) => ({ id: f.id, api_name: f.api_name, data_type: f.data_type ?? null, length: f.length ?? null }));
+    .map((f) => ({ id: f.id, api_name: f.api_name, data_type: f.data_type ?? null, length: f.length ?? null, custom_field: !!f.custom_field }));
 
   const dealFields = await zoho(conn, "/crm/v8/settings/fields?module=Deals");
-  const dealFieldList = ((dealFields.body as { fields?: Array<{ id: string; api_name: string; data_type?: string; length?: number; pick_list_values?: Array<{ id: string; actual_value: string; probability: number; forecast_category?: { id: string; name: string } }> }> })?.fields ?? []);
+  const dealFieldList = ((dealFields.body as { fields?: Array<{ id: string; api_name: string; data_type?: string; length?: number; custom_field?: boolean; pick_list_values?: Array<{ id: string; actual_value: string; probability: number; forecast_category?: { id: string; name: string } }> }> })?.fields ?? []);
   const stageField = dealFieldList.find((f) => f.api_name === "Stage");
   const stages = (stageField?.pick_list_values ?? []).map((v) => ({
     id: v.id,
@@ -152,7 +181,17 @@ async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
     forecast_category_name: v.forecast_category?.name ?? "Pipeline",
   }));
   // P12: Deals custom-field index for teardown of Deal-module fields.
-  const fields_deals = dealFieldList.filter((f) => !!f.api_name).map((f) => ({ id: f.id, api_name: f.api_name, data_type: f.data_type ?? null, length: f.length ?? null }));
+  const fields_deals = dealFieldList.filter((f) => !!f.api_name).map((f) => ({ id: f.id, api_name: f.api_name, data_type: f.data_type ?? null, length: f.length ?? null, custom_field: !!f.custom_field }));
+
+  const contactFields = await zoho(conn, "/crm/v8/settings/fields?module=Contacts");
+  const fields_contacts = (((contactFields.body as { fields?: Array<{ id: string; api_name: string; data_type?: string; length?: number; custom_field?: boolean }> })?.fields) ?? [])
+    .filter((f) => !!f.api_name)
+    .map((f) => ({ id: f.id, api_name: f.api_name, data_type: f.data_type ?? null, length: f.length ?? null, custom_field: !!f.custom_field }));
+
+  const accountFields = await zoho(conn, "/crm/v8/settings/fields?module=Accounts");
+  const fields_accounts = (((accountFields.body as { fields?: Array<{ id: string; api_name: string; data_type?: string; length?: number; custom_field?: boolean }> })?.fields) ?? [])
+    .filter((f) => !!f.api_name)
+    .map((f) => ({ id: f.id, api_name: f.api_name, data_type: f.data_type ?? null, length: f.length ?? null, custom_field: !!f.custom_field }));
 
   const layouts = await zoho(conn, "/crm/v8/settings/layouts?module=Deals");
   const default_deals_layout_id = (((layouts.body as { layouts?: Array<{ id: string; status: string }> })?.layouts) ?? [])
@@ -167,7 +206,7 @@ async function snapshot(conn: ConnectionContext): Promise<Snapshot> {
     }));
   }
 
-  return { fields_lead, fields_deals, stages, pipelines, stage_field_id: stageField?.id ?? null, default_deals_layout_id };
+  return { fields_lead, fields_deals, fields_contacts, fields_accounts, stages, pipelines, stage_field_id: stageField?.id ?? null, default_deals_layout_id };
 }
 
 // --- Planning --------------------------------------------------------------
@@ -186,10 +225,12 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
   let seq = 1;
 
   for (const f of spec.fields) {
-    const moduleApi = f.module === "Lead" ? "Leads" : f.module === "Deal" ? "Deals" : f.module;
-    const list = moduleApi === "Deals" ? snap.fields_deals : snap.fields_lead;
+    const moduleApi = moduleApiForZoho(f.module);
+    const list = snapshotFieldsForModule(snap, moduleApi);
     const existing = list.find((x) => x.api_name === f.api_name);
     let diff: PlanStep["diff"] = "create";
+    let notes: string | undefined;
+    let adoptResult: Record<string, unknown> | undefined;
     if (existing) {
       if (f.adopt_if_exists === false) {
         throw new DataError({
@@ -209,14 +250,35 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
         });
       }
       diff = "adopt";
+      adoptResult = { adopted_field_id: existing.id, adopted_field_api_name: existing.api_name, adopted_kind: existing.custom_field ? "existing_custom_field" : "native_standard_field" };
+      notes = existing.custom_field
+        ? `Zoho: adopting existing ${moduleApi}.${existing.api_name} field`
+        : `Zoho: adopting native ${moduleApi}.${existing.api_name} field`;
+    } else {
+      const normalized = normalizeZohoFieldName(f.api_name);
+      const nativeNames = new Set((ZOHO_NATIVE_STANDARD_FIELDS as Record<string, string[]>)[moduleApi] ?? []);
+      const nativeMatches = list.filter((x) => nativeNames.has(x.api_name) && normalizeZohoFieldName(x.api_name) === normalized);
+      if (nativeMatches.length > 1 || (nativeMatches.length === 1 && list.some((x) => x.custom_field && normalizeZohoFieldName(x.api_name) === normalized))) {
+        throw new DataError({
+          message: `field ${moduleApi}.${f.api_name} collides with both native and custom Zoho fields after normalization. Refusing to guess which one to adopt — rename the spec field or set a customer-specific override.`,
+          vendorCode: "AMBIGUOUS_NATIVE_FIELD_COLLISION",
+        });
+      }
+      if (nativeMatches.length === 1) {
+        diff = "adopt";
+        const native = nativeMatches[0]!;
+        adoptResult = { adopted_field_id: native.id, adopted_field_api_name: native.api_name, adopted_kind: "native_standard_field" };
+        notes = `Zoho: adopting native ${moduleApi}.${native.api_name} field instead of creating duplicate ${f.api_name}`;
+      }
     }
     steps.push({
       seq: seq++,
       operation: "create_field",
       target: f.module,
-      payload: f as FieldPayload,
+      payload: adoptResult ? { ...(f as FieldPayload), adopt_result: adoptResult } : f as FieldPayload,
       diff,
       destructive: false,
+      notes,
     });
   }
 
@@ -274,7 +336,7 @@ async function planSpec(conn: ConnectionContext, spec: ProvisionSpec, snap: Snap
 // --- Apply -----------------------------------------------------------------
 
 async function createField(conn: ConnectionContext, f: FieldPayload): Promise<unknown> {
-  const moduleApi = f.module === "Lead" ? "Leads" : f.module === "Deal" ? "Deals" : f.module;
+  const moduleApi = moduleApiForZoho(f.module);
   const body = {
     fields: [{
       api_name: f.api_name,
@@ -516,11 +578,11 @@ async function createIdleDealAlertWorkflow(conn: ConnectionContext, w: Extract<W
 
 async function createFieldDerivationWorkflow(conn: ConnectionContext, w: Extract<WorkflowShape, { shape: "field_derivation" }>): Promise<unknown> {
   const fuName = `prov_${w.api_name}_fu`;
-  const fuId = await createFieldUpdate(conn, fuName, w.module === "Lead" ? "Leads" : w.module, w.target_field, w.source_field);
+  const fuId = await createFieldUpdate(conn, fuName, moduleApiForZoho(w.module), w.target_field, w.source_field);
   const triggerType: WorkflowRuleSpec["trigger_type"] = w.when === "on_create" ? "create" : w.when === "on_update" ? "edit" : "create_or_edit";
   const ruleId = await createWorkflowRule(conn, {
     name: `prov_${w.api_name}`,
-    module: w.module === "Lead" ? "Leads" : w.module,
+    module: moduleApiForZoho(w.module),
     trigger_type: triggerType,
     repeat: true,
     instantActionIds: [{ id: fuId, type: "field_updates" }],
@@ -551,6 +613,26 @@ async function createPipeline(conn: ConnectionContext, p: { api_name: string; la
     }],
   };
   const { status, body: respBody, retryAfter } = await zoho(conn, `/crm/v8/settings/pipeline?layout_id=${snap.default_deals_layout_id}`, { method: "POST", body });
+  if (status >= 400) throw classifyZohoResponse({ status, body: respBody, retryAfterHeader: retryAfter });
+  const pipelineId = (respBody as { pipeline?: Array<{ details?: { id?: string } }> })?.pipeline?.[0]?.details?.id;
+  return {
+    pipeline_id: pipelineId ?? null,
+    layout_id: snap.default_deals_layout_id,
+    api_name: p.api_name,
+    raw: respBody,
+  };
+}
+
+async function deletePipeline(conn: ConnectionContext, pipelineId: string, layoutId: string): Promise<unknown> {
+  // Zoho's documented DELETE pipeline path returns 400. The working platform path,
+  // captured in the org-variance taxonomy as PIPELINE_DELETE_MARKER_PATH, is an
+  // update-style delete marker on the specific pipeline id scoped to the layout.
+  const body = { pipeline: [{ _delete: true }] };
+  const { status, body: respBody, retryAfter } = await zoho(
+    conn,
+    `/crm/v8/settings/pipeline/${pipelineId}?layout_id=${encodeURIComponent(layoutId)}`,
+    { method: "PUT", body },
+  );
   if (status >= 400) throw classifyZohoResponse({ status, body: respBody, retryAfterHeader: retryAfter });
   return respBody;
 }
@@ -623,9 +705,9 @@ export const zohoAdapter: Adapter = {
             continue;
           }
           const f = step.payload as FieldPayload;
-          const moduleApi = f.module === "Lead" ? "Leads" : f.module === "Deal" ? "Deals" : f.module;
+          const moduleApi = moduleApiForZoho(f.module);
           // P12: per-module field index, no second snapshot fetch.
-          const list = moduleApi === "Leads" ? snap.fields_lead : moduleApi === "Deals" ? snap.fields_deals : [];
+          const list = snapshotFieldsForModule(snap, moduleApi);
           const target = list.find((x) => x.api_name === f.api_name);
           if (!target) {
             const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "create_field", note: "already-absent" } };
@@ -637,9 +719,18 @@ export const zohoAdapter: Adapter = {
           const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "create_field", deleted_id: target.id } };
           results.push(r); onStep(r);
         } else if (step.operation === "create_pipeline") {
-          // S0: pipeline DELETE shape returned 400 — investigated as residue, not a teardown bug.
-          // Marking reversed-with-residue so the run ledger is honest.
-          const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "create_pipeline", residue: "pipeline_remains_in_layout_residue" } };
+          const resultJson = step.result as { pipeline_id?: string | null; layout_id?: string | null; api_name?: string } | null;
+          const payload = step.payload as { api_name: string };
+          const pipelineApiName = resultJson?.api_name ?? payload.api_name;
+          const pipelineId = resultJson?.pipeline_id ?? snap.pipelines.find((x) => x.api_name === pipelineApiName)?.id;
+          const layoutId = resultJson?.layout_id ?? snap.default_deals_layout_id;
+          if (!pipelineId || !layoutId) {
+            const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "create_pipeline", residue: "pipeline_identity_missing", note: "pipeline delete-marker path needs pipeline_id + layout_id; manual cleanup may be required" } };
+            results.push(r); onStep(r);
+            continue;
+          }
+          await deletePipeline(conn, pipelineId, layoutId);
+          const r: StepResult = { seq: step.seq, status: "succeeded", result: { reversed: "create_pipeline", deleted_pipeline_id: pipelineId, layout_id: layoutId } };
           results.push(r); onStep(r);
         } else if (step.operation === "add_stage") {
           // Whole-array replace teardown: complex (would need to PATCH with the stage removed).
