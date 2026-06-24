@@ -45,3 +45,5 @@ OAuth web flow standard; S0 used CLI-managed auth. For the Worker: standard auth
 Everything in the v1 sales-function vocabulary is provisionable: fields + FLS (Tooling/Metadata), stages (Metadata, deactivate-semantics), assignment rules (Metadata, whole-file), flows/alerts (Metadata, coords required), teardown via destructiveChanges. The adapter is a **metadata-package compiler + a Tooling client + a permset generator**, all async-aware. Architecture risk #3 (deploy latency → async apply) CONFIRMED. No `❌ manual` on the critical path except one-time Dev Hub enablement for scratch orgs (P2.5 future).
 
 Verified live end-to-end in P2: a single-field delta plans, applies, idempotently re-plans to noop, and tears down cleanly. All 9 SFDC assertions in the SF_LIVE smoke pass.
+
+Related: [`salesforce-org-variance-taxonomy.md`](./salesforce-org-variance-taxonomy.md) defines the professional classification language for org-specific constraints the future Salesforce specialist layer will need to handle.
