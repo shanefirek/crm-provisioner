@@ -2,7 +2,7 @@
 
 CRM-agnostic provisioning engine: natural language → typed `ProvisionSpec` (template + delta) → deterministic driver → CRM adapter. **Claude is the interface** (MCP server); there is no UI in v1. First adapters: Salesforce, Zoho.
 
-**This is venture IP.** Strategic / business / team context tracked in local-only docs (see `docs/venture-context.local.md` if present, gitignored). Clean-room rule: pattern knowledge from Shane's own prior provisioner work is fine; **no code copied from any client or employer repo.**
+**This is venture IP.** Target users: implementation consultants and CRM partner firms — the people configuring CRMs by hand today, per client, over and over. Clean-room rule: pattern knowledge from prior provisioner work is fine; **no code copied from any client or employer repo.**
 
 ## Start here
 

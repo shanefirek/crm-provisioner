@@ -10,7 +10,7 @@
 6. **Deluge = compile target with a vetted pattern library (≤8), not a language to learn.** Domain SMEs are the Deluge oracle; patterns enter the library only deploy-tested. Same fail-closed shape as the spec's extension points.
 7. **Adapter order deliberately unresolved.** Plan builds SFDC first (scratch orgs = scriptable demos; investor-track fundraising lean) but Zoho-first remains arguable (distribution lead = customer #1 pipeline). To be settled in a 1:1 — distribution/fundraising decision, not technical. The agnostic core makes the cost of being wrong one phase's reordering.
 8. **Calendar reality:** the build window is ~2 weeks against parallel external commitments. Realistic plan: S0+P0+P1+P2 (SFDC demo) inside 2 weeks; P3-P4 the week after. Beating it is upside, not the plan.
-9. **IP hygiene:** clean-room rule in CLAUDE.md observed throughout; venture structure and external-party context tracked in local-only docs (see CLAUDE.md routing).
+9. **IP hygiene:** clean-room rule from CLAUDE.md observed throughout — no code copied from any client or employer repo. Personal naming and external-party identifiers are kept out of tracked docs; engineering and strategic substance lives here.
 
 ## 2026-06-12 (late) — entry 10: Host pivot, Cloudflare → Railway
 
