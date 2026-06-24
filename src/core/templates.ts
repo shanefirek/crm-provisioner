@@ -37,9 +37,8 @@ const TOY_SALES: Template = {
 // ---- real-estate@v1 ----
 // Authored from generic real-estate brokerage shape: residential agents working
 // inquiry → showing → offer → contract → close. No vendor-specific assumptions.
-// Partners (UD / Ashim on contact) customize via deltas; the extension-point set
-// allows adding new fields, stages, pipelines, and workflows without touching
-// the base.
+// Partners customize via deltas; the extension-point set allows adding new
+// fields, stages, pipelines, and workflows without touching the base.
 const REAL_ESTATE_V1: Template = {
   id: "real-estate",
   version: "v1",
@@ -102,9 +101,9 @@ const PROFESSIONAL_SERVICES_V1: Template = {
 };
 
 // ---- hvac-services@v1 ----
-// Field service / trades shape (HVAC, plumbing, electrical). The Zoho-buyer-fit
-// vertical called out on the 6/12 venture call. Authored from "set up Zoho for
-// a field service contractor" canon — partner customizes per business.
+// Field service / trades shape (HVAC, plumbing, electrical). Authored from the
+// "set up Zoho for a field service contractor" canon — partner customizes per
+// business.
 const HVAC_SERVICES_V1: Template = {
   id: "hvac-services",
   version: "v1",

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Turn a plain-English CRM setup request into a configured Zoho or Salesforce instance, deterministically and auditable. The LLM authors a small **delta** over a curated **template**; a deterministic driver compiles and applies the effective spec through a per-CRM adapter. Interface is an MCP server (Claude = UI). Buyers per the 2026-06-12 venture call: implementation consultants/partners (cost optimization), with Zoho UK pre-sales and TRA's Salesforce partner co as beta targets.
+Turn a plain-English CRM setup request into a configured Zoho or Salesforce instance, deterministically and auditable. The LLM authors a small **delta** over a curated **template**; a deterministic driver compiles and applies the effective spec through a per-CRM adapter. Interface is an MCP server (Claude = UI). Target buyers: implementation consultants and partner firms (cost optimization on initial CRM setup work).
 
 ## Data flow
 
@@ -33,7 +33,7 @@ Claude (MCP client)
 | MCP server (7 tools, `StreamableHTTPServerTransport`), OAuth routes, pg persistence | `src/host/` (Express + pg on Railway) | everything above |
 | Template library | `templates/` | spec schema (data, not code) |
 
-Dependency direction is strictly downward in this table. The core stays portable — host swap (e.g., back to Workers, or to bare Node) is a `src/host/` rewrite only. **(History: P0 shipped first on Cloudflare Workers + Durable Objects + D1; pivoted same night to Express + Postgres on Railway after Stefan/HubSpot-provisioner-fluency reweighting — see `docs/decision-log.md` entry 10.)**
+Dependency direction is strictly downward in this table. The core stays portable — host swap (e.g., back to Workers, or to bare Node) is a `src/host/` rewrite only. **(History: P0 shipped first on Cloudflare Workers + Durable Objects + D1; pivoted same night to Express + Postgres on Railway based on prior-provisioner-pattern fluency — see `docs/decision-log.md` entry 10.)**
 
 ## Principle audit table
 

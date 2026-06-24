@@ -8,7 +8,7 @@ You've walked into this repo cold (or it's been a few days). This is the single 
 
 **Original framing (2026-06-13, now superseded).** Earlier we marked `round_robin_assignment` as `manual` because the standard implementation is a Deluge function and S0 probed `POST /crm/v8/settings/functions` once, got `REQUIRED_PARAM_MISSING: metadata`, and gave up. The harvest formalized that as `manual` with a documented one-time-paste script.
 
-**Shane's correction:** "Deluge is not UI-only — people use Deluge." This is correct. The Zoho partner ecosystem (Ashim's network) lives in Deluge; calling it manual undersells our app. We considered the webhook workaround (Zoho fires `/webhooks/zoho/{conn_id}/round-robin` at our server, server picks owner via REST) but Shane correctly pushed back: that's dodging Deluge, not handling it. If our pitch is "we configure Zoho via Claude," we have to ship Deluge programmatically the way partners do.
+**Correction (post-S0):** "Deluge is not UI-only — people use Deluge." The Zoho partner ecosystem lives in Deluge; calling it manual undersells the app. The webhook workaround (Zoho fires `/webhooks/zoho/{conn_id}/round-robin` at our server, server picks owner via REST) was considered but rejected: that's dodging Deluge, not handling it. If the pitch is "we configure Zoho via Claude," we ship Deluge programmatically the way partners do.
 
 **The 4 real paths to investigate, none of which we've actually probed yet:**
 1. `POST /crm/v8/settings/functions` with the *correct* body wrapper. The endpoint exists; S0's body was wrong. Worth real adversarial probing — same failure mode as the wrong workflow_rules path in S0 → P4.5 harvest correction.
@@ -64,14 +64,14 @@ A CRM-agnostic provisioning engine. A user (via Claude / MCP) picks a template (
 - **SFDC OAuth web flow** — adapter currently shells out to local `sf api request rest`. P3 host work replaces with proper OAuth. The CLI's `~/.sfdx/{user}.json` token is encrypted with a machine-local key; direct Bearer fetch fails.
 - **Adopt-or-create on fields** — currently we noop-or-error on existing fields; we don't "adopt" them as the spec's stable-key target. Pattern-imported gap from the prior-art review (see [`docs/prior-art-public-app-provisioner.md`](./prior-art-public-app-provisioner.md) #2).
 - **Reconcile / drift detection** — plan is "create-if-missing"; we don't PATCH on drift yet. Same prior-art doc, #6.
-- **HubSpot adapter** — no work yet. Stefan suggested HubSpot as the obvious third CRM. Platform tribal knowledge already captured in prior-art doc.
+- **HubSpot adapter** — no work yet. Identified as the obvious third CRM. Platform tribal knowledge already captured in prior-art doc.
 
 ## Read order for common tasks
 
 | If you're doing… | Read these, in order |
 |---|---|
 | Anything build-related, first time back | [`CLAUDE.md`](../CLAUDE.md) → this file → [`docs/architecture.md`](./architecture.md) → [`docs/iteration-plan.md`](./iteration-plan.md) (current phase + retro) |
-| Adding a new CRM adapter | [`docs/surfaces/`](./surfaces/) for the new vendor (run `api-ingest` skill if not present) → [`docs/prior-art-hubspot-provisioner.md`](./prior-art-hubspot-provisioner.md) for shape lessons → [`src/adapters/types.ts`](../src/adapters/types.ts) for the interface |
+| Adding a new CRM adapter | [`docs/surfaces/`](./surfaces/) for the new vendor (run `api-ingest` skill if not present) → [`docs/prior-art-public-app-provisioner.md`](./prior-art-public-app-provisioner.md) for shape lessons → [`src/adapters/types.ts`](../src/adapters/types.ts) for the interface |
 | Adding a new template | [`src/core/templates.ts`](../src/core/templates.ts) (data only, follow the existing 4 verticals) → smoke must include a plan-viability assertion for the new template against live |
 | Debugging a Zoho plan/apply failure | [`docs/surfaces/zoho-surface.md`](./surfaces/zoho-surface.md) capability map + envelope quirks → [`docs/surfaces/zoho-deluge-patterns.md`](./surfaces/zoho-deluge-patterns.md) for workflow shapes |
 | Debugging a Salesforce plan/apply failure | [`docs/surfaces/salesforce-surface.md`](./surfaces/salesforce-surface.md) capability map + envelope quirks |

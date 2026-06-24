@@ -51,17 +51,17 @@ PORT=8788 ZOHO_LIVE=1 SF_LIVE=1 bash scripts/smoke-p0.sh
 - *"The LLM didn't write any Zoho API calls. It wrote a delta. The driver wrote the API calls — deterministically, with idempotency and a plan-then-apply gate."*
 - *"Everything we just did is recorded — what spec produced what state, which steps ran, which ones were unsupported. You can audit it later, or hand it to a client as proof."*
 
-## Demo B — Investor audience (TRA-shaped)
+## Demo B — Investor audience
 
 **Audience:** An investor who's seen 40 "AI configures CRM" demos that are wrappers over GPT. The pitch is *what makes ours not that*.
 
-**Setup (one time):** Same MCP wiring. Live demo runs against shane-dev (Salesforce), because that's the one TRA's principal cares about.
+**Setup (one time):** Same MCP wiring. Live demo runs against the Salesforce dev org for investors leaning into the SFDC ecosystem.
 
 **Live demo (4–5 min):**
 
 1. *"We pick Salesforce because that's where the spend is. Same MVP runs against Zoho — same backend, different adapter."*
 2. *"Watch what the LLM has to author. Not Apex. Not metadata XML. A delta on a vetted template."*
-3. Claude: `list_templates` → `connect_crm` (salesforce, shane-dev) → `inspect_instance` → user asks for one extension.
+3. Claude: `list_templates` → `connect_crm` (salesforce, dev alias) → `inspect_instance` → user asks for one extension.
 4. `plan` shows the diff. Point at the `unsupported` and `destructive` flags: *"This is what we mean by structural — the LLM physically cannot author into points the template doesn't declare extensible. And destructive ops require an explicit confirm."*
 5. `apply` runs. Show the Salesforce UI updating.
 6. *"Now the moat."* Open `src/core/spec.ts` for 10 seconds. *"This is the typed contract every CRM compiles to. New CRM = new adapter file. New vertical = new template. The hard part isn't here — it's the encoded domain judgment in the templates, which is where partners contribute."*
@@ -69,7 +69,7 @@ PORT=8788 ZOHO_LIVE=1 SF_LIVE=1 bash scripts/smoke-p0.sh
 
 **The two beats that land for an investor:**
 - *"AI does the thing it's good at — authoring a small typed delta — and the deterministic driver does the unsafe thing. Same shape as Terraform, with a vetted-template moat."*
-- *"Salesforce works. Zoho works on the same engine. Adapter cost is days, not months. Distribution to Salesforce partners via TRA's network IS the plan; Zoho via Ashim's network IS the plan; we don't need to pick — we ship both."*
+- *"Salesforce works. Zoho works on the same engine. Adapter cost is days, not months. Distribution to partner-firm networks IS the plan; we ship both."*
 
 ## Failure-mode rehearsal (what to do if a demo breaks live)
 
